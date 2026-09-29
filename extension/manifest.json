@@ -15,8 +15,7 @@
   "chrome_url_overrides": { "newtab": "index.html" },
   "background": { "service_worker": "background.js" },
   "action": {
-    "default_title": "Save tab to PaperClip",
-    "default_popup": "popup.html",
+    "default_title": "PaperClip",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png"

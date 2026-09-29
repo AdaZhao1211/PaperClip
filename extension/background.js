@@ -24,6 +24,31 @@ async function updateBadge() {
 
 const PAPERS_KEY = 'papers';
 
+// 'auto'   — every paper tab the user opens is added to the library.
+// 'manual' — nothing is added until the user clicks the toolbar icon on the
+//            tab. Papers already in the library still get their visit count /
+//            last-seen updated.
+// The switch lives in the new-tab page's settings menu.
+const CAPTURE_MODE_KEY = 'captureMode';
+
+async function getCaptureMode() {
+  const store = await chrome.storage.local.get(CAPTURE_MODE_KEY);
+  return store[CAPTURE_MODE_KEY] === 'manual' ? 'manual' : 'auto';
+}
+
+/**
+ * Classification for a tab added by hand that the URL classifier doesn't
+ * recognize (e.g. a PDF served without a .pdf path). The user chose it, so
+ * store it keyed by its URL.
+ */
+function manualClassification(rawUrl) {
+  let u;
+  try { u = new URL(rawUrl); } catch { return null; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  const norm = `${u.protocol}//${u.hostname.replace(/^www\./, '')}${u.pathname}${u.search || ''}`;
+  return { source: 'pdf', sourceId: null, canonicalId: `url:${norm}` };
+}
+
 const SOURCE_LABELS = {
   arxiv: 'arXiv',
   openreview: 'OpenReview',
@@ -103,24 +128,33 @@ function findExistingPaper(papers, canonicalId) {
  *                paper changed; otherwise just refresh title if missing.
  *   'discover' — found via tab scan / backfill. Add only if absent.
  *                Doesn't bump visitCount or lastSeenAt for existing entries.
+ *   'manual'   — the user clicked the toolbar icon. Adds the tab even in
+ *                manual capture mode, and even if the classifier doesn't
+ *                recognize the URL.
+ *
+ * In manual capture mode, 'visit' and 'discover' never create new entries.
+ *
+ * Returns { id, created } for the paper the tab maps to, or null.
  */
 async function capturePaper(tab, mode = 'visit') {
-  if (!tab || !tab.url) return;
-  const cls = classifyPaper(tab.url);
+  if (!tab || !tab.url) return null;
+  const cls = classifyPaper(tab.url) || (mode === 'manual' ? manualClassification(tab.url) : null);
   if (!cls) {
     if (tab.id != null) lastCapturedByTab.delete(tab.id);
-    return;
+    return null;
   }
 
   const now = new Date().toISOString();
-  const store = await chrome.storage.local.get(PAPERS_KEY);
+  const store = await chrome.storage.local.get([PAPERS_KEY, CAPTURE_MODE_KEY]);
   const papers = store[PAPERS_KEY] || {};
   const existing = findExistingPaper(papers, cls.canonicalId);
+  const mayCreate = mode === 'manual' || store[CAPTURE_MODE_KEY] !== 'manual';
+  if (!existing && !mayCreate) return null;
 
   let didMutate = false;
 
   if (existing) {
-    if (mode === 'visit') {
+    if (mode === 'visit' || mode === 'manual') {
       const tabPrev = tab.id != null ? lastCapturedByTab.get(tab.id) : null;
       const isFreshVisit = tabPrev !== cls.canonicalId;
       if (isFreshVisit) {
@@ -162,7 +196,8 @@ async function capturePaper(tab, mode = 'visit') {
   }
 
   if (tab.id != null) lastCapturedByTab.set(tab.id, cls.canonicalId);
-  if (!didMutate) return;
+  const result = { id: (existing || papers[cls.canonicalId]).id, created: !existing };
+  if (!didMutate) return result;
 
   await chrome.storage.local.set({ [PAPERS_KEY]: papers });
 
@@ -173,6 +208,7 @@ async function capturePaper(tab, mode = 'visit') {
   if (paper && paper.enrichmentStatus !== 'ok' && paper.enrichmentStatus !== 'unsupported') {
     scheduleEnrichment(paper.id);
   }
+  return result;
 }
 
 // ─── Auto-attach related tabs ─────────────────────────────────────────────────
@@ -212,6 +248,7 @@ function findVeryHighConfidenceMatch(papers, tab) {
 async function maybeAutoAttachToRelated(tab) {
   if (!tab || !tab.url || !tab.title) return;
   if (!/^https?:/i.test(tab.url)) return;
+  if (await getCaptureMode() === 'manual') return;
   // Skip tabs that ARE a paper URL — those are auto-captured as the paper
   // itself, not as an attachment to a different paper.
   if (classifyPaper(tab.url)) return;
@@ -243,6 +280,7 @@ async function maybeAutoAttachToRelated(tab) {
  */
 async function backfillExistingTabs() {
   let added = 0;
+  if (await getCaptureMode() === 'manual') return added;
   try {
     const tabs = await chrome.tabs.query({});
     for (const t of tabs) {
@@ -563,8 +601,63 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   lastCapturedByTab.delete(tabId);
 });
 
+// ─── Manual mode: toolbar icon ────────────────────────────────────────────────
+//
+// In manual mode, clicking the toolbar icon saves the current tab. The badge
+// shows each tab's state: "+" on a paper tab that isn't saved yet, "✓" once
+// it's in the library. In auto mode the icon does nothing and has no badge.
+
+async function updateTabBadge(tab) {
+  if (!tab || tab.id == null) return;
+  let text = '';
+  if (tab.url && await getCaptureMode() === 'manual') {
+    const papers = (await chrome.storage.local.get(PAPERS_KEY))[PAPERS_KEY] || {};
+    const cls = classifyPaper(tab.url);
+    const manual = manualClassification(tab.url);
+    const saved = (cls && findExistingPaper(papers, cls.canonicalId)) ||
+                  (manual && findExistingPaper(papers, manual.canonicalId));
+    if (saved) text = '✓';
+    else if (cls) text = '+';
+  }
+  try {
+    await chrome.action.setBadgeText({ tabId: tab.id, text });
+    if (text) {
+      await chrome.action.setBadgeBackgroundColor({
+        tabId: tab.id,
+        color: text === '✓' ? '#3d7a4a' : '#c8713a',
+      });
+    }
+  } catch {}
+}
+
+async function updateActionTitle() {
+  const title = await getCaptureMode() === 'manual'
+    ? 'PaperClip — click to save this tab'
+    : 'PaperClip — auto-adding papers you open';
+  try { await chrome.action.setTitle({ title }); } catch {}
+}
+
+chrome.action.onClicked.addListener(async (tab) => {
+  if (await getCaptureMode() !== 'manual') return;
+  await capturePaper(tab, 'manual');
+  updateTabBadge(tab);
+});
+
+async function updateAllTabBadges() {
+  const tabs = await chrome.tabs.query({});
+  for (const t of tabs) updateTabBadge(t);
+}
+
+// Switching modes, or adding / deleting papers, changes which tabs need a "+".
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes[CAPTURE_MODE_KEY]) updateActionTitle();
+  if (changes[CAPTURE_MODE_KEY] || changes[PAPERS_KEY]) updateAllTabBadges();
+});
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   updateBadge();
+  if (changeInfo.url || changeInfo.status === 'complete') updateTabBadge(tab);
   // Capture on URL change (eager — don't wait for load to finish), on load
   // complete (so we get the final title), and on title-only updates (Chrome
   // sometimes sets the title after status='complete'). capturePaper dedupes
@@ -593,4 +686,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // Initial run
 updateBadge();
+updateActionTitle();
+updateAllTabBadges();
 backfillExistingTabs().then(() => retryStuckEnrichments());

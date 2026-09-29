@@ -14,6 +14,7 @@ const TAGS_KEY = 'tags';
 const TAG_COLUMNS_KEY = 'tagColumns';
 const DEFAULT_COLUMN_ID = 'default';
 const COLUMN_WIDTHS_KEY = 'columnWidths';
+const CAPTURE_MODE_KEY = 'captureMode';
 
 const SOURCE_LABELS = {
   arxiv: 'arXiv',
@@ -1452,6 +1453,22 @@ function initSettingsMenu() {
   const menu = document.getElementById('settingsMenu');
   const fileInput = document.getElementById('importFile');
   if (!btn || !menu || !fileInput) return;
+
+  // Auto-add switch — same setting as the toolbar popup's switch.
+  const autoAdd = document.getElementById('autoAddToggle');
+  if (autoAdd) {
+    chrome.storage.local.get(CAPTURE_MODE_KEY).then(store => {
+      autoAdd.checked = store[CAPTURE_MODE_KEY] !== 'manual';
+    });
+    autoAdd.addEventListener('change', () => {
+      chrome.storage.local.set({ [CAPTURE_MODE_KEY]: autoAdd.checked ? 'auto' : 'manual' });
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes[CAPTURE_MODE_KEY]) {
+        autoAdd.checked = changes[CAPTURE_MODE_KEY].newValue !== 'manual';
+      }
+    });
+  }
 
   btn.addEventListener('click', (e) => {
     e.stopPropagation();

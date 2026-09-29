@@ -545,6 +545,51 @@ header {
 .settings-menu-item svg { color: var(--muted); flex-shrink: 0; }
 .settings-menu-item:hover svg { color: var(--ink); }
 
+.settings-switch {
+  justify-content: space-between;
+}
+
+.settings-switch input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.settings-switch-track {
+  position: relative;
+  flex-shrink: 0;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: rgba(154, 145, 138, 0.4);
+  transition: background 0.15s;
+}
+
+.settings-switch-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--card-bg);
+  box-shadow: 0 1px 2px rgba(26, 22, 19, 0.2);
+  transition: transform 0.15s;
+}
+
+.settings-switch input:checked + .settings-switch-track {
+  background: var(--status-active);
+}
+
+.settings-switch input:checked + .settings-switch-track::after {
+  transform: translateX(12px);
+}
+
+.settings-switch input:focus-visible + .settings-switch-track {
+  box-shadow: 0 0 0 2px rgba(61, 122, 74, 0.25);
+}
+
 .settings-divider {
   height: 1px;
   background: var(--warm-gray);
