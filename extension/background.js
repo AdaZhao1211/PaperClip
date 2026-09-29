@@ -280,7 +280,9 @@ const ENRICH_THROTTLE_MS = 900;
 
 // Bumped whenever the enrichment schema or behavior changes meaningfully.
 // retryStuckEnrichments() re-runs anything below the current version.
-const ENRICHMENT_VERSION = 2;
+// v3: IEEE metadata read from the open tab (v2 marked WAF-blocked IEEE
+// papers as 'ok' with no data).
+const ENRICHMENT_VERSION = 3;
 
 const enrichQueued = new Set();
 let enrichChain = Promise.resolve();
@@ -313,7 +315,7 @@ async function runEnrichmentOnce(canonicalId) {
 
   let patches = null;
   try {
-    patches = await PaperEnrich.enrich(paper);
+    patches = await PaperEnrich.enrich(paper, { runInIEEETab });
   } catch (err) {
     console.warn('[paperclip] enrich error', canonicalId, err);
     paper.enrichmentStatus = 'failed';
@@ -337,6 +339,7 @@ async function runEnrichmentOnce(canonicalId) {
   if (patches.venue) paper.venue = patches.venue;
   if (patches.abstract) paper.abstract = patches.abstract;
   if (patches.externalIds) paper.externalIds = patches.externalIds;
+  if (patches.doi && !paper.doi) paper.doi = patches.doi;
   paper.enrichmentStatus = 'ok';
   paper.enrichedAt = new Date().toISOString();
   paper.enrichmentVersion = ENRICHMENT_VERSION;
@@ -348,6 +351,79 @@ async function runEnrichmentOnce(canonicalId) {
   dedupeAcrossExternalIds(papers, canonicalId);
 
   await chrome.storage.local.set({ [PAPERS_KEY]: papers });
+}
+
+// ─── IEEE: read metadata from inside an open tab ─────────────────────────────
+//
+// IEEE Xplore answers service-worker fetches with an AWS WAF bot challenge.
+// A tab the user has open already passed it, so we run the probe there: its
+// same-origin fetch carries the WAF token cookie.
+
+function isIEEEHost(host) {
+  host = (host || '').toLowerCase();
+  return host === 'ieeexplore.ieee.org' || /^ieeexplore-ieee-org\./.test(host);
+}
+
+async function waitForTabComplete(tabId, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t) return false;
+    if (t.status === 'complete') return true;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return false;
+}
+
+/**
+ * Run `func(...args)` in an open IEEE Xplore tab and return its result.
+ * Tries tabs showing this paper first, then any other IEEE tab. Tabs where
+ * injection fails (Chrome's PDF viewer, hosts without permission) or that
+ * return null (still on the bot challenge) are skipped.
+ */
+async function runInIEEETab(func, args, paper) {
+  const tabs = (await chrome.tabs.query({})).filter(t => {
+    try { return isIEEEHost(new URL(t.url).hostname); } catch { return false; }
+  });
+  const isThisPaper = t => {
+    const cls = classifyPaper(t.url);
+    return !!cls && (cls.canonicalId === paper.id ||
+      (Array.isArray(paper.aliases) && paper.aliases.includes(cls.canonicalId)));
+  };
+  tabs.sort((a, b) => isThisPaper(b) - isThisPaper(a));
+
+  for (const tab of tabs) {
+    try {
+      if (tab.status !== 'complete' && !(await waitForTabComplete(tab.id))) continue;
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        func,
+        args,
+      });
+      if (res && res.result) return res.result;
+    } catch (err) {
+      console.warn('[paperclip] ieee tab injection failed', tab.id, err);
+    }
+  }
+  return null;
+}
+
+/**
+ * When an IEEE tab finishes loading, retry any IEEE paper whose enrichment
+ * failed — the first attempt often runs while the tab is still on the bot
+ * challenge, and only a loaded tab can supply the metadata.
+ */
+async function retryIEEEOnTabLoad(tab) {
+  const cls = classifyPaper(tab.url);
+  if (!cls || cls.source !== 'ieee') return;
+  const store = await chrome.storage.local.get(PAPERS_KEY);
+  const papers = store[PAPERS_KEY] || {};
+  for (const p of Object.values(papers)) {
+    if (p.source === 'ieee' && (p.enrichmentStatus === 'failed' || p.enrichmentStatus === 'pending')) {
+      scheduleEnrichment(p.id);
+    }
+  }
 }
 
 /**
@@ -497,6 +573,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (tab && tab.url) {
       capturePaper(tab, 'visit');
       maybeAutoAttachToRelated(tab);
+      if (changeInfo.status === 'complete') retryIEEEOnTabLoad(tab);
     }
   }
 });

@@ -222,34 +222,88 @@
   }
 
   // ─── IEEE Xplore web metadata (arnumber-based) ──────────────────────────
+  //
+  // ieeexplore.ieee.org sits behind an AWS WAF bot challenge, so a plain
+  // fetch from the service worker gets a 202 JS-challenge page instead of the
+  // document. The page the user has open already passed the challenge, so the
+  // preferred path is to read the metadata from inside that tab (see
+  // ieeeTabProbe + ctx.runInIEEETab). The direct fetch is only a fallback.
+  //
+  // IEEE doesn't emit citation_* meta tags; the metadata lives in an inline
+  // script as `xplGlobal.document.metadata = {...};`.
 
-  function ieeeArnumberFromPaper(paper) {
-    if (paper && /^\d+$/.test(String(paper.sourceId || ''))) return String(paper.sourceId);
-    if (paper && paper.url) {
-      try {
-        const u = new URL(paper.url);
-        const q = u.searchParams.get('arnumber');
-        if (q && /^\d+$/.test(q)) return q;
-        const m = (u.pathname || '').match(/\/(?:abstract\/)?document\/(\d+)/i);
-        if (m) return m[1];
-      } catch {}
+  /**
+   * Injected into an IEEE tab via chrome.scripting.executeScript, so it must
+   * be self-contained (no closure references). Returns the live metadata
+   * object when the tab is already showing this document, otherwise the HTML
+   * of /document/<arnumber>/ fetched same-origin (relative URL, so it also
+   * works through EZproxy hosts). Returns null on a bot-challenge page.
+   */
+  async function ieeeTabProbe(arnumber) {
+    const g = window.xplGlobal;
+    const live = g && g.document && g.document.metadata;
+    if (live && String(live.articleNumber) === String(arnumber)) {
+      return { metadata: live };
+    }
+    const r = await fetch(`/document/${arnumber}/`, { credentials: 'include' });
+    if (!r.ok) return null;
+    const html = await r.text();
+    if (/gokuProps|AwsWafIntegration/.test(html)) return null;
+    return { html };
+  }
+
+  function isIEEEChallengePage(html) {
+    return /gokuProps|AwsWafIntegration/.test(html) || !/xplGlobal/.test(html);
+  }
+
+  // Pull the JSON object assigned to xplGlobal.document.metadata out of the
+  // page HTML by scanning for its balanced closing brace.
+  function extractXplMetadata(html) {
+    const m = /xplGlobal\.document\.metadata\s*=\s*\{/.exec(html || '');
+    if (!m) return null;
+    const start = m.index + m[0].length - 1;
+    let depth = 0;
+    let inString = false;
+    for (let i = start; i < html.length; i++) {
+      const ch = html[i];
+      if (inString) {
+        if (ch === '\\') i++;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}' && --depth === 0) {
+        try { return JSON.parse(html.slice(start, i + 1)); } catch { return null; }
+      }
     }
     return null;
   }
 
-  async function enrichIEEE(paper) {
-    const arnumber = ieeeArnumberFromPaper(paper);
-    if (!arnumber) return null;
+  function ieeeFromXplMetadata(md) {
+    const text = v => cleanWhitespace(decodeHtmlEntities(stripHtml(String(v || ''))));
 
-    const url = `https://ieeexplore.ieee.org/document/${encodeURIComponent(arnumber)}/`;
-    const r = await fetch(url, {
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      }
-    });
-    if (!r.ok) throw new Error(`ieee: HTTP ${r.status}`);
-    const html = await r.text();
+    const title = text(md.formulaStrippedArticleTitle || md.title || md.displayDocTitle);
+    const authors = Array.isArray(md.authors)
+      ? md.authors
+        .map(a => text(a && (a.name || `${a.firstName || ''} ${a.lastName || ''}`)))
+        .filter(Boolean)
+      : [];
+    const venue = text(md.displayPublicationTitle || md.publicationTitle);
+    const abstract = text(md.abstract);
+    const doi = normalizeDoi(md.doi);
 
+    let year = null;
+    const yearSrc = [md.publicationYear, md.publicationDate, md.conferenceDate, md.onlineDate]
+      .map(v => String(v || ''))
+      .find(v => /\b(19|20)\d{2}\b/.test(v));
+    if (yearSrc) year = parseInt(yearSrc.match(/\b(19|20)\d{2}\b/)[0], 10);
+
+    return { title, authors, year, venue, abstract, doi };
+  }
+
+  // Fallback for pages without xplGlobal: whatever meta tags are present.
+  function ieeeFromMetaTags(html) {
     const title =
       readMetaContent(html, 'citation_title') ||
       readMetaContent(html, 'dc.title') ||
@@ -272,8 +326,6 @@
       ''
     );
 
-    const doi = extractDoiFromIEEEHtml(html);
-
     let year = null;
     const pubDate =
       readMetaContent(html, 'citation_publication_date') ||
@@ -283,11 +335,70 @@
     const yearMatch = String(pubDate).match(/\b(19|20)\d{2}\b/);
     if (yearMatch) year = parseInt(yearMatch[0], 10);
 
-    const out = { title: cleanWhitespace(title), authors };
-    if (year) out.year = year;
-    if (venue) out.venue = venue;
-    if (abstract) out.abstract = abstract;
-    if (doi) out.doi = doi.toLowerCase();
+    return { title: cleanWhitespace(title), authors, year, venue, abstract, doi: extractDoiFromIEEEHtml(html) };
+  }
+
+  function ieeeFromHtml(html) {
+    const md = extractXplMetadata(html);
+    return md ? ieeeFromXplMetadata(md) : ieeeFromMetaTags(html);
+  }
+
+  function ieeeArnumberFromPaper(paper) {
+    if (paper && /^\d+$/.test(String(paper.sourceId || ''))) return String(paper.sourceId);
+    if (paper && paper.url) {
+      try {
+        const u = new URL(paper.url);
+        const q = u.searchParams.get('arnumber');
+        if (q && /^\d+$/.test(q)) return q;
+        const m = (u.pathname || '').match(/\/(?:abstract\/)?document\/(\d+)/i);
+        if (m) return m[1];
+      } catch {}
+    }
+    return null;
+  }
+
+  async function enrichIEEE(paper, ctx) {
+    const arnumber = ieeeArnumberFromPaper(paper);
+    if (!arnumber) return null;
+
+    let info = null;
+
+    // 1. Preferred: read from an open IEEE tab that already passed the WAF.
+    if (ctx && ctx.runInIEEETab) {
+      try {
+        const probe = await ctx.runInIEEETab(ieeeTabProbe, [arnumber], paper);
+        if (probe && probe.metadata) info = ieeeFromXplMetadata(probe.metadata);
+        else if (probe && probe.html) info = ieeeFromHtml(probe.html);
+      } catch (err) {
+        console.warn('[paperclip] ieee tab probe failed', paper.id, err);
+      }
+    }
+
+    // 2. Fallback: direct fetch. Usually hits the bot challenge, which comes
+    //    back as HTTP 202 — so check the body, not just r.ok.
+    if (!info || (!info.title && !info.doi)) {
+      const url = `https://ieeexplore.ieee.org/document/${encodeURIComponent(arnumber)}/`;
+      const r = await fetch(url, {
+        credentials: 'include',
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+      });
+      if (!r.ok) throw new Error(`ieee: HTTP ${r.status}`);
+      const html = await r.text();
+      if (isIEEEChallengePage(html)) throw new Error('ieee: blocked by bot challenge');
+      info = ieeeFromHtml(html);
+    }
+
+    // An empty result must not count as success, or the paper gets stuck as
+    // 'ok' with no metadata and is never retried.
+    if (!info.title && !info.doi) throw new Error('ieee: no metadata found');
+
+    const out = { title: info.title, authors: info.authors };
+    if (info.year) out.year = info.year;
+    if (info.venue) out.venue = info.venue;
+    if (info.abstract) out.abstract = info.abstract;
+    if (info.doi) out.doi = info.doi.toLowerCase();
     return out;
   }
 
@@ -345,6 +456,7 @@
       venue: supplement.venue || primary.venue || null,
       abstract: primary.abstract || supplement.abstract || null,
       externalIds: supplement.externalIds || primary.externalIds || null,
+      doi: primary.doi || supplement.doi || null,
     };
   }
 
@@ -357,7 +469,9 @@
   // retries later. If both return null (i.e. 404s), return null for
   // 'unsupported'.
 
-  async function enrich(paper) {
+  // ctx (optional, supplied by the service worker):
+  //   runInIEEETab(func, args, paper) — run func inside an open IEEE tab.
+  async function enrich(paper, ctx) {
     if (!paper) return null;
 
     let primary = null;
@@ -379,7 +493,7 @@
           primary = await enrichCrossref(paper);
           break;
         case 'ieee':
-          primary = await enrichIEEE(paper);
+          primary = await enrichIEEE(paper, ctx);
           break;
       }
     } catch (err) {
