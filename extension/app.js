@@ -11,6 +11,9 @@
 
 const PAPERS_KEY = 'papers';
 const TAGS_KEY = 'tags';
+const TAG_COLUMNS_KEY = 'tagColumns';
+const DEFAULT_COLUMN_ID = 'default';
+const COLUMN_WIDTHS_KEY = 'columnWidths';
 
 const SOURCE_LABELS = {
   arxiv: 'arXiv',
@@ -142,18 +145,19 @@ function genTagId() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-async function createTag(rawName) {
+async function createTag(rawName, columnId) {
   const name = (rawName || '').trim();
-  if (!name) return null;
+  if (!name || !columnId) return null;
   const tags = await getTags();
-  // Avoid creating an exact-name duplicate; reuse the existing one's id.
+  // Avoid creating an exact-name duplicate within the column; reuse the
+  // existing one's id. The same name may exist in a different column.
   const existing = Object.values(tags).find(
-    t => t.name.toLowerCase() === name.toLowerCase()
+    t => t.columnId === columnId && t.name.toLowerCase() === name.toLowerCase()
   );
   if (existing) return existing.id;
   const id = genTagId();
   const hue = computeHueFromString(name + id);
-  tags[id] = { id, name, createdAt: new Date().toISOString(), colorHue: hue };
+  tags[id] = { id, name, columnId, createdAt: new Date().toISOString(), colorHue: hue };
   await saveTags(tags);
   return id;
 }
@@ -182,6 +186,90 @@ async function deleteTagById(id) {
   await chrome.storage.local.set({ [PAPERS_KEY]: papers, [TAGS_KEY]: tags });
 }
 
+// ─── Tag columns ──────────────────────────────────────────────────────────────
+//
+// Tags are grouped into named columns — one per dimension of a literature
+// review (e.g. "Method", "Domain"). Each tag belongs to exactly one column via
+// tag.columnId, so a column's tags are shared by every paper but separate from
+// other columns. paper.tags stays a flat list of tag IDs; each column's cell
+// shows the subset that belongs to it.
+
+function sortedColumns(columns) {
+  return Object.values(columns).sort((a, b) =>
+    (a.order || 0) - (b.order || 0) || (a.createdAt || '').localeCompare(b.createdAt || '')
+  );
+}
+
+/**
+ * Load tags + columns, migrating as needed: the first time (no columns stored)
+ * a default "Tags" column is created, and any tag without a valid column —
+ * tags from before columns existed, or imported ones — is moved into it.
+ */
+async function getTagModel() {
+  const store = await chrome.storage.local.get([TAGS_KEY, TAG_COLUMNS_KEY]);
+  const tags = store[TAGS_KEY] || {};
+  const firstRun = !store[TAG_COLUMNS_KEY];
+  const columns = store[TAG_COLUMNS_KEY] || {};
+  let changed = firstRun;
+
+  const orphans = Object.values(tags).filter(t => !t.columnId || !columns[t.columnId]);
+  if ((firstRun || orphans.length) && !columns[DEFAULT_COLUMN_ID]) {
+    const maxOrder = Math.max(-1, ...Object.values(columns).map(c => c.order || 0));
+    columns[DEFAULT_COLUMN_ID] = {
+      id: DEFAULT_COLUMN_ID,
+      name: 'Tags',
+      order: maxOrder + 1,
+      createdAt: new Date().toISOString(),
+    };
+    changed = true;
+  }
+  for (const t of orphans) {
+    t.columnId = DEFAULT_COLUMN_ID;
+    changed = true;
+  }
+
+  if (changed) {
+    await chrome.storage.local.set({ [TAGS_KEY]: tags, [TAG_COLUMNS_KEY]: columns });
+  }
+  return { tags, columns };
+}
+
+async function createColumn(rawName) {
+  const name = (rawName || '').trim() || 'Untitled';
+  const { columns } = await getTagModel();
+  const id = genTagId();
+  const maxOrder = Math.max(-1, ...Object.values(columns).map(c => c.order || 0));
+  columns[id] = { id, name, order: maxOrder + 1, createdAt: new Date().toISOString() };
+  await chrome.storage.local.set({ [TAG_COLUMNS_KEY]: columns });
+  return id;
+}
+
+async function renameColumn(id, rawName) {
+  const name = (rawName || '').trim();
+  if (!name) return;
+  const { columns } = await getTagModel();
+  if (!columns[id]) return;
+  columns[id].name = name;
+  await chrome.storage.local.set({ [TAG_COLUMNS_KEY]: columns });
+}
+
+async function deleteColumn(id) {
+  // Remove the column, every tag in it, and those tags from every paper —
+  // one batched write so the UI sees a consistent snapshot.
+  const { tags, columns } = await getTagModel();
+  const papers = await getPapers();
+  const doomed = new Set(Object.values(tags).filter(t => t.columnId === id).map(t => t.id));
+  for (const p of Object.values(papers)) {
+    if (Array.isArray(p.tags) && p.tags.some(t => doomed.has(t))) {
+      p.tags = p.tags.filter(t => !doomed.has(t));
+    }
+  }
+  for (const tagId of doomed) delete tags[tagId];
+  delete columns[id];
+  await chrome.storage.local.set({ [PAPERS_KEY]: papers, [TAGS_KEY]: tags, [TAG_COLUMNS_KEY]: columns });
+  return doomed;
+}
+
 function countPapersWithTag(allPapers, tagId) {
   let n = 0;
   for (const p of allPapers) {
@@ -204,7 +292,7 @@ async function getOpenPaperMap() {
 // ─── Filtering / sorting ──────────────────────────────────────────────────────
 
 // Sidebar filter state. type ∈ 'all' | 'starred' | 'untagged' | 'tag'.
-// When 'tag', tagIds is a Set of tag IDs (OR'd together).
+// When 'tag', tagIds is a Set of tag IDs (OR within a column, AND across).
 const activeFilter = { type: 'all', tagIds: new Set() };
 
 function paperMatchesFilter(p, q, tags) {
@@ -225,17 +313,25 @@ function paperMatchesFilter(p, q, tags) {
   return hay.includes(q);
 }
 
-function paperMatchesActiveTag(p) {
+function paperMatchesActiveTag(p, tagsById) {
   switch (activeFilter.type) {
     case 'all':      return true;
     case 'starred':  return !!p.starred;
     case 'untagged': return !Array.isArray(p.tags) || p.tags.length === 0;
     case 'tag': {
-      const tags = Array.isArray(p.tags) ? p.tags : [];
+      // OR within a column, AND across columns — e.g. (Method: survey OR
+      // interview) AND (Domain: health).
+      const paperTags = new Set(Array.isArray(p.tags) ? p.tags : []);
+      const byColumn = new Map();
       for (const id of activeFilter.tagIds) {
-        if (tags.includes(id)) return true;
+        const col = tagsById[id] ? tagsById[id].columnId : null;
+        if (!byColumn.has(col)) byColumn.set(col, []);
+        byColumn.get(col).push(id);
       }
-      return false;
+      for (const ids of byColumn.values()) {
+        if (!ids.some(id => paperTags.has(id))) return false;
+      }
+      return true;
     }
     default: return true;
   }
@@ -329,7 +425,29 @@ function renderDetail(p) {
 
 // ─── Rendering ────────────────────────────────────────────────────────────────
 
-function renderRow(p, openMap, tagsById) {
+function renderTagCell(p, column, tagObjs) {
+  return `
+      <div class="paper-col-tags">
+        <button class="paper-tags-btn"
+                data-action="edit-tags"
+                data-paper-id="${escapeHtml(p.id)}"
+                data-column-id="${escapeHtml(column.id)}"
+                title="Edit ${escapeHtml(column.name)}"
+                aria-label="Edit ${escapeHtml(column.name)} for this paper">
+          <span class="paper-tags-list">
+            ${tagObjs.length
+              ? tagObjs.map(t => {
+                  const cols = tagColorsFor(t);
+                  return `<span class="paper-tag-chip" style="background:${cols.bg};color:${cols.fg}">${escapeHtml(t.name)}</span>`;
+                }).join('')
+              : '<span class="paper-tags-empty">—</span>'}
+          </span>
+          <span class="paper-tags-edit">+</span>
+        </button>
+      </div>`;
+}
+
+function renderRow(p, openMap, tagsById, columns) {
   const open = openMap.get(p.id);
   const isOpen = !!open;
 
@@ -345,7 +463,7 @@ function renderRow(p, openMap, tagsById) {
   const sourceLabel = SOURCE_LABELS[p.source] || p.source || '';
   const hasRealMeta = authorsList.length > 0 || p.year || p.venue;
   const tagIds = Array.isArray(p.tags) ? [...new Set(p.tags.filter(Boolean))] : [];
-  const tagObjs = tagIds.map(id => (tagsById && tagsById[id]) ? tagsById[id] : { id, name: id });
+  const tagObjs = tagIds.map(id => tagsById[id]).filter(Boolean);
 
   // Sub-line below title: source · venue · time ago · visits · status
   const subParts = [];
@@ -399,23 +517,7 @@ function renderRow(p, openMap, tagsById) {
                   data-paper-id="${escapeHtml(p.id)}"
                   placeholder="Add a note…">${escapeHtml(p.note || '')}</textarea>
       </div>
-      <div class="paper-col-tags">
-        <button class="paper-tags-btn"
-                data-action="edit-tags"
-                data-paper-id="${escapeHtml(p.id)}"
-                title="Edit tags"
-                aria-label="Edit tags for this paper">
-          <span class="paper-tags-list">
-            ${tagObjs.length
-              ? tagObjs.map(t => {
-                  const cols = tagColorsFor(t);
-                  return `<span class="paper-tag-chip" style="background:${cols.bg};color:${cols.fg}">${escapeHtml(t.name)}</span>`;
-                }).join('')
-              : '<span class="paper-tags-empty">—</span>'}
-          </span>
-          <span class="paper-tags-edit">+</span>
-        </button>
-      </div>
+      ${columns.map(col => renderTagCell(p, col, tagObjs.filter(t => t.columnId === col.id))).join('')}
       <div class="paper-actions">
         <button class="paper-icon-btn paper-star-btn"
                 data-action="toggle-star"
@@ -457,7 +559,7 @@ function renderRow(p, openMap, tagsById) {
 async function renderSidebar() {
   const nav = document.getElementById('sidebarNav');
   if (!nav) return;
-  const [papers, tags] = await Promise.all([getPapers(), getTags()]);
+  const [papers, { tags, columns }] = await Promise.all([getPapers(), getTagModel()]);
   const all = Object.values(papers);
 
   const total = all.length;
@@ -517,13 +619,23 @@ async function renderSidebar() {
     `;
   }
 
-  const tagsBlock = userTags.length === 0
-    ? ''
-    : `
+  // One section per tag column, each with its own "+" to add a tag to it.
+  const tagsBlock = sortedColumns(columns).map(col => `
       <div class="sidebar-divider"></div>
-      <div class="sidebar-section-label">Tags</div>
-      ${userTags.map(renderUserTag).join('')}
-    `;
+      <div class="sidebar-section-head">
+        <div class="sidebar-section-label">${escapeHtml(col.name)}</div>
+        <button class="sidebar-section-add"
+                data-new-tag-column="${escapeHtml(col.id)}"
+                title="New tag in ${escapeHtml(col.name)}"
+                aria-label="New tag in ${escapeHtml(col.name)}">+</button>
+      </div>
+      ${userTags.filter(t => t.columnId === col.id).map(renderUserTag).join('')}
+      <input class="sidebar-new-tag-input"
+             data-new-tag-input-for="${escapeHtml(col.id)}"
+             type="text"
+             placeholder="Tag name, then Enter"
+             hidden>
+    `).join('');
 
   nav.innerHTML = `
     <div class="sidebar-section-label">Library</div>
@@ -532,12 +644,171 @@ async function renderSidebar() {
     ${builtin('untagged', 'Untagged',   untaggedCount)}
     ${tagsBlock}
     <div class="sidebar-divider"></div>
-    <button class="sidebar-new-tag" id="sidebarNewTagBtn">
+    <button class="sidebar-new-tag" data-column-action="add">
       <span class="sidebar-new-tag-icon">+</span>
-      <span>New tag</span>
+      <span>New column</span>
     </button>
-    <input class="sidebar-new-tag-input" id="sidebarNewTagInput" type="text" placeholder="Tag name, then Enter" hidden>
   `;
+}
+
+// Column currently being renamed inline in the table header, if any.
+let editingColumnId = null;
+
+// ─── Column widths ────────────────────────────────────────────────────────────
+//
+// Every column can be resized by dragging the right edge of its header.
+// columnWidths maps a column key ('title' | 'authors' | 'year' | 'note' | a tag
+// column id) to a fixed pixel width. Columns without an entry keep their
+// flexible default track.
+
+const FIXED_COLUMNS = [
+  { key: 'title',   track: 'minmax(150px, 1fr)',   min: 150 },
+  { key: 'authors', track: 'minmax(80px, 0.7fr)',  min: 80 },
+  { key: 'year',    track: '56px',                 min: 56 },
+  { key: 'note',    track: 'minmax(200px, 1fr)',   min: 200 },
+];
+const TAG_COLUMN_TRACK = { track: 'minmax(140px, 0.6fr)', min: 140 };
+const MIN_RESIZE_WIDTH = { title: 120, authors: 60, year: 40, note: 80, tag: 80 };
+const GRID_GAP = 14;
+const GRID_EDGE = 18 + 92 + 28; // select column + actions column + row padding
+
+let columnWidths = {};
+let currentTagColumns = [];
+
+async function loadColumnWidths() {
+  const store = await chrome.storage.local.get(COLUMN_WIDTHS_KEY);
+  columnWidths = store[COLUMN_WIDTHS_KEY] || {};
+}
+
+function saveColumnWidths() {
+  // Drop widths for tag columns that no longer exist.
+  const live = new Set([...FIXED_COLUMNS.map(c => c.key), ...currentTagColumns.map(c => c.id)]);
+  for (const key of Object.keys(columnWidths)) {
+    if (!live.has(key)) delete columnWidths[key];
+  }
+  return chrome.storage.local.set({ [COLUMN_WIDTHS_KEY]: columnWidths });
+}
+
+/**
+ * Write the grid template and table min-width to CSS variables, from the
+ * current tag columns and saved widths. Cheap enough to call on every
+ * pointermove while dragging.
+ */
+function applyColumnLayout() {
+  const cols = [
+    ...FIXED_COLUMNS,
+    ...currentTagColumns.map(c => ({ key: c.id, ...TAG_COLUMN_TRACK })),
+  ];
+  const tracks = cols.map(c => columnWidths[c.key] ? `${columnWidths[c.key]}px` : c.track);
+  const minWidth = GRID_EDGE
+    + cols.reduce((sum, c) => sum + (columnWidths[c.key] || c.min), 0)
+    + GRID_GAP * (cols.length + 1);
+
+  const rootStyle = document.documentElement.style;
+  rootStyle.setProperty('--paper-grid-columns', `18px ${tracks.join(' ')} 92px`);
+  rootStyle.setProperty('--paper-table-min-width', `${minWidth}px`);
+  rootStyle.setProperty('--tag-col-count', String(currentTagColumns.length));
+}
+
+function initColumnResize() {
+  let drag = null;
+
+  document.addEventListener('pointerdown', (e) => {
+    const handle = e.target.closest('.col-resizer');
+    if (!handle || e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const key = handle.dataset.resizeCol;
+    const cell = handle.parentElement;
+    drag = {
+      key,
+      handle,
+      startX: e.clientX,
+      startWidth: cell.getBoundingClientRect().width,
+      min: MIN_RESIZE_WIDTH[key] || MIN_RESIZE_WIDTH.tag,
+    };
+    try { handle.setPointerCapture(e.pointerId); } catch {}
+    handle.classList.add('is-dragging');
+    document.body.classList.add('is-resizing-col');
+  });
+
+  document.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const width = Math.max(drag.min, Math.round(drag.startWidth + e.clientX - drag.startX));
+    if (columnWidths[drag.key] === width) return;
+    columnWidths[drag.key] = width;
+    applyColumnLayout();
+  });
+
+  const endDrag = () => {
+    if (!drag) return;
+    drag.handle.classList.remove('is-dragging');
+    drag = null;
+    document.body.classList.remove('is-resizing-col');
+    saveColumnWidths();
+  };
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', endDrag);
+
+  // Double-click the handle: back to the column's default flexible width.
+  document.addEventListener('dblclick', (e) => {
+    const handle = e.target.closest('.col-resizer');
+    if (!handle) return;
+    e.preventDefault();
+    delete columnWidths[handle.dataset.resizeCol];
+    applyColumnLayout();
+    saveColumnWidths();
+  });
+
+  // Don't let the click that ends a drag fall through to row/selection logic.
+  document.addEventListener('click', (e) => {
+    if (e.target.closest && e.target.closest('.col-resizer')) e.stopPropagation();
+  }, true);
+}
+
+function renderTagColumnHeaders(columns) {
+  const wrap = document.getElementById('tagColumnHeaders');
+  if (!wrap) return;
+  currentTagColumns = columns;
+  applyColumnLayout();
+  // Don't clobber a rename in progress when a background re-render lands.
+  const active = document.activeElement;
+  if (active && active.classList.contains('tag-col-name-input') && wrap.contains(active)) return;
+
+  wrap.innerHTML = columns.map(col => {
+    const id = escapeHtml(col.id);
+    if (col.id === editingColumnId) {
+      return `
+        <div class="tag-col-header" data-column-id="${id}">
+          <input class="tag-col-name-input" data-column-id="${id}" type="text" value="${escapeHtml(col.name)}" aria-label="Column name">
+        </div>`;
+    }
+    return `
+      <div class="tag-col-header" data-column-id="${id}">
+        <button class="paper-col-label tag-col-name"
+                data-column-action="rename"
+                data-column-id="${id}"
+                title="Rename column">${escapeHtml(col.name)}</button>
+        <div class="col-resizer" data-resize-col="${id}" title="Drag to resize · double-click to reset"></div>
+        <button class="tag-col-action"
+                data-column-action="delete"
+                data-column-id="${id}"
+                title="Delete column"
+                aria-label="Delete column ${escapeHtml(col.name)}">
+          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 6h18"/>
+            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            <path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+          </svg>
+        </button>
+      </div>`;
+  }).join('');
+
+  const input = wrap.querySelector('.tag-col-name-input');
+  if (input) {
+    input.focus();
+    input.select();
+  }
 }
 
 async function renderLibrary(filter = '') {
@@ -547,12 +818,16 @@ async function renderLibrary(filter = '') {
   const emptyEl = document.getElementById('paperEmpty');
   if (!list) return;
 
-  const [papers, openMap, tags] = await Promise.all([getPapers(), getOpenPaperMap(), getTags()]);
+  const [papers, openMap, { tags, columns: columnsById }] = await Promise.all([
+    getPapers(), getOpenPaperMap(), getTagModel(),
+  ]);
   const all = Object.values(papers);
+  const columns = sortedColumns(columnsById);
+  renderTagColumnHeaders(columns);
 
   const q = filter.trim().toLowerCase();
   let filtered = q ? all.filter(p => paperMatchesFilter(p, q, tags)) : all;
-  filtered = filtered.filter(paperMatchesActiveTag);
+  filtered = filtered.filter(p => paperMatchesActiveTag(p, tags));
   const sorted = sortPapers(filtered);
 
   if (all.length === 0) {
@@ -581,7 +856,7 @@ async function renderLibrary(filter = '') {
   countEl.textContent = isFiltered
     ? `${sorted.length} of ${all.length}`
     : `${all.length} paper${all.length === 1 ? '' : 's'}`;
-  list.innerHTML = sorted.map(p => renderRow(p, openMap, tags)).join('');
+  list.innerHTML = sorted.map(p => renderRow(p, openMap, tags, columns)).join('');
 
   // Drop selections that no longer exist (e.g. after delete)
   const valid = new Set(all.map(p => p.id));
@@ -630,7 +905,7 @@ function updateSelectAllCheckbox() {
   }
 }
 
-function formatPaperForCopy(p) {
+function formatPaperForCopy(p, tagModel) {
   const lines = [];
   lines.push(p.title || p.id);
   if (Array.isArray(p.authors) && p.authors.length) lines.push(p.authors.join(', '));
@@ -640,6 +915,16 @@ function formatPaperForCopy(p) {
     SOURCE_LABELS[p.source] || p.source || null,
   ].filter(Boolean).join(' · ');
   if (meta) lines.push(meta);
+  // One "Column: tag, tag" line per tag column the paper has tags in.
+  if (tagModel && Array.isArray(p.tags) && p.tags.length) {
+    for (const col of sortedColumns(tagModel.columns)) {
+      const names = p.tags
+        .map(id => tagModel.tags[id])
+        .filter(t => t && t.columnId === col.id)
+        .map(t => t.name);
+      if (names.length) lines.push(`${col.name}: ${names.join(', ')}`);
+    }
+  }
   if (p.note) {
     lines.push('');
     lines.push('Note: ' + p.note);
@@ -667,7 +952,8 @@ async function copySelectedToClipboard() {
   if (!selected.length) return 0;
   // Sort selected the same way the list is sorted (consistent paste order)
   const sorted = sortPapers(selected);
-  const text = sorted.map(formatPaperForCopy).join('\n\n---\n\n');
+  const tagModel = await getTagModel();
+  const text = sorted.map(p => formatPaperForCopy(p, tagModel)).join('\n\n---\n\n');
   await navigator.clipboard.writeText(text);
   return selected.length;
 }
@@ -825,8 +1111,9 @@ document.addEventListener('click', async (e) => {
     }
     if (action === 'edit-tags') {
       const paperId = actionBtn.dataset.paperId || row.dataset.id;
-      if (paperId) {
-        await openTagPickerFor(actionBtn, paperId);
+      const columnId = actionBtn.dataset.columnId;
+      if (paperId && columnId) {
+        await openTagPickerFor(actionBtn, paperId, columnId);
       }
       return;
     }
@@ -837,7 +1124,7 @@ document.addEventListener('click', async (e) => {
       const paper = papers[id];
       if (!paper) return;
       try {
-        await navigator.clipboard.writeText(formatPaperForCopy(paper));
+        await navigator.clipboard.writeText(formatPaperForCopy(paper, await getTagModel()));
       } catch (err) {
         console.warn('[paperclip] copy failed', err);
         return;
@@ -943,15 +1230,27 @@ function scheduleRender(delay = 200) {
   }, delay);
 }
 
+function refreshAll() {
+  const search = document.getElementById('paperSearch');
+  return Promise.all([renderSidebar(), renderLibrary(search ? search.value : '')]);
+}
+
 document.addEventListener('input', (e) => {
   if (e.target && e.target.id === 'paperSearch') {
     scheduleRender(80);
   }
 });
 
-// Re-render whenever the service worker writes new papers / enrichment.
+// Re-render whenever the service worker writes new papers / enrichment, or
+// tags / columns change (e.g. from another new-tab page).
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || !changes[PAPERS_KEY]) return;
+  if (area !== 'local') return;
+  if (changes[COLUMN_WIDTHS_KEY]) {
+    // Another new-tab page resized a column.
+    columnWidths = changes[COLUMN_WIDTHS_KEY].newValue || {};
+    applyColumnLayout();
+  }
+  if (!changes[PAPERS_KEY] && !changes[TAGS_KEY] && !changes[TAG_COLUMNS_KEY]) return;
   scheduleRender(150);
 });
 
@@ -983,17 +1282,17 @@ function downloadJson(filename, obj) {
 }
 
 async function exportLibrary() {
-  const store = await chrome.storage.local.get([PAPERS_KEY, TAGS_KEY]);
-  const papers = store[PAPERS_KEY] || {};
-  const tags = store[TAGS_KEY] || {};
+  const papers = await getPapers();
+  const { tags, columns } = await getTagModel();
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   downloadJson(`paperclip-backup-${stamp}.json`, {
-    schema: 'paperclip.library.v2',
+    schema: 'paperclip.library.v3',
     exportedAt: new Date().toISOString(),
     paperCount: Object.keys(papers).length,
     tagCount: Object.keys(tags).length,
     papers,
     tags,
+    tagColumns: columns,
   });
   return { count: Object.keys(papers).length };
 }
@@ -1067,14 +1366,25 @@ async function importLibrary(file) {
   const hasEnvelope = parsed && typeof parsed === 'object' && parsed.papers && typeof parsed.papers === 'object';
   const incomingPapers = hasEnvelope ? parsed.papers : parsed;
   const incomingTags = hasEnvelope && parsed.tags && typeof parsed.tags === 'object' ? parsed.tags : {};
+  const incomingColumns = hasEnvelope && parsed.tagColumns && typeof parsed.tagColumns === 'object' ? parsed.tagColumns : {};
 
   if (!incomingPapers || typeof incomingPapers !== 'object') {
     return { error: 'Unexpected file shape — expected an object of papers.' };
   }
 
-  const store = await chrome.storage.local.get([PAPERS_KEY, TAGS_KEY]);
-  const papers = store[PAPERS_KEY] || {};
-  const tags = store[TAGS_KEY] || {};
+  const papers = await getPapers();
+  const { tags, columns } = await getTagModel();
+
+  // Columns first, same rule as tags below: existing ids keep their local name.
+  for (const [id, c] of Object.entries(incomingColumns)) {
+    if (!c || typeof c !== 'object' || !id || columns[id]) continue;
+    columns[id] = {
+      id,
+      name: typeof c.name === 'string' && c.name ? c.name : 'Untitled',
+      order: typeof c.order === 'number' ? c.order : Object.keys(columns).length,
+      createdAt: typeof c.createdAt === 'string' ? c.createdAt : new Date().toISOString(),
+    };
+  }
 
   // Merge tags map first so paper.tags references are valid afterwards.
   // Tag ids that already exist locally keep their existing name (no rename
@@ -1088,6 +1398,10 @@ async function importLibrary(file) {
         name: typeof t.name === 'string' && t.name ? t.name : id,
         createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString(),
       };
+      // Older backups have no columnId; getTagModel() files those under the
+      // default column on the next load.
+      if (typeof t.columnId === 'string') tags[id].columnId = t.columnId;
+      if (typeof t.colorHue === 'number') tags[id].colorHue = t.colorHue;
       tagsAdded++;
     }
   }
@@ -1105,7 +1419,7 @@ async function importLibrary(file) {
     }
   }
 
-  await chrome.storage.local.set({ [PAPERS_KEY]: papers, [TAGS_KEY]: tags });
+  await chrome.storage.local.set({ [PAPERS_KEY]: papers, [TAGS_KEY]: tags, [TAG_COLUMNS_KEY]: columns });
   return { added, merged, skipped, tagsAdded };
 }
 
@@ -1190,6 +1504,7 @@ function initSettingsMenu() {
 
 let tagPickerEl = null;
 let tagPickerPaperId = null;
+let tagPickerColumnId = null;
 let tagPickerAnchor = null;
 
 const PICKER_CHECKMARK = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`;
@@ -1222,9 +1537,10 @@ function positionTagPicker(el, anchor) {
   el.style.left = 'auto';
 }
 
-async function openTagPickerFor(anchorBtn, paperId) {
+async function openTagPickerFor(anchorBtn, paperId, columnId) {
   const el = ensureTagPickerEl();
   tagPickerPaperId = paperId;
+  tagPickerColumnId = columnId;
   tagPickerAnchor = anchorBtn;
   el.hidden = false;
   const input = el.querySelector('.tag-picker-input');
@@ -1238,6 +1554,7 @@ function closeTagPicker() {
   if (!tagPickerEl) return;
   tagPickerEl.hidden = true;
   tagPickerPaperId = null;
+  tagPickerColumnId = null;
   tagPickerAnchor = null;
 }
 
@@ -1247,11 +1564,13 @@ async function renderTagPickerList() {
   const input = tagPickerEl.querySelector('.tag-picker-input');
   const filter = (input.value || '').trim().toLowerCase();
 
-  const [papers, tags] = await Promise.all([getPapers(), getTags()]);
+  const [papers, { tags, columns }] = await Promise.all([getPapers(), getTagModel()]);
   const paper = papers[tagPickerPaperId];
-  if (!paper) { closeTagPicker(); return; }
+  const column = columns[tagPickerColumnId];
+  if (!paper || !column) { closeTagPicker(); return; }
+  tagPickerEl.querySelector('.tag-picker-header').textContent = column.name;
 
-  const allTags = Object.values(tags).sort((a, b) =>
+  const allTags = Object.values(tags).filter(t => t.columnId === column.id).sort((a, b) =>
     (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' })
   );
   const matchedTags = filter
@@ -1295,8 +1614,8 @@ async function pickerToggleTag(tagId) {
 }
 
 async function pickerCreateAndAttach(name) {
-  if (!tagPickerPaperId) return;
-  const id = await createTag(name);
+  if (!tagPickerPaperId || !tagPickerColumnId) return;
+  const id = await createTag(name, tagPickerColumnId);
   if (!id) return;
   await patchPaper(tagPickerPaperId, p => {
     p.tags = Array.isArray(p.tags) ? p.tags : [];
@@ -1341,7 +1660,8 @@ function initTagPicker() {
         if (!name) return;
         const tags = await getTags();
         const matched = Object.values(tags).find(
-          t => (t.name || '').toLowerCase() === name.toLowerCase()
+          t => t.columnId === tagPickerColumnId &&
+               (t.name || '').toLowerCase() === name.toLowerCase()
         );
         if (matched) {
           await pickerToggleTag(matched.id);
@@ -1432,11 +1752,13 @@ function initSidebar() {
       }
     }
 
-    // 2. New-tag button — swap to inline input
-    const newBtn = e.target.closest('#sidebarNewTagBtn');
+    // 2. A column's "+" — reveal that column's inline new-tag input
+    const newBtn = e.target.closest('[data-new-tag-column]');
     if (newBtn) {
-      const input = document.getElementById('sidebarNewTagInput');
-      newBtn.hidden = true;
+      const input = nav.querySelector(
+        `[data-new-tag-input-for="${CSS.escape(newBtn.dataset.newTagColumn)}"]`
+      );
+      if (!input) return;
       input.hidden = false;
       input.value = '';
       input.focus();
@@ -1491,38 +1813,97 @@ function initSidebar() {
   });
 
   nav.addEventListener('keydown', async (e) => {
-    if (e.target && e.target.id === 'sidebarNewTagInput') {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        const name = e.target.value.trim();
-        e.target.hidden = true;
-        const btn = document.getElementById('sidebarNewTagBtn');
-        if (btn) btn.hidden = false;
-        if (name) {
-          await createTag(name);
-          refresh();
-        }
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        e.target.hidden = true;
-        const btn = document.getElementById('sidebarNewTagBtn');
-        if (btn) btn.hidden = false;
+    const columnId = e.target && e.target.dataset && e.target.dataset.newTagInputFor;
+    if (!columnId) return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const name = e.target.value.trim();
+      e.target.hidden = true;
+      if (name) {
+        await createTag(name, columnId);
+        refresh();
       }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.target.hidden = true;
     }
   });
 
   // Cancel new-tag input when it loses focus without an Enter
   nav.addEventListener('focusout', (e) => {
-    if (e.target && e.target.id === 'sidebarNewTagInput') {
+    const input = e.target;
+    if (input && input.dataset && input.dataset.newTagInputFor) {
       // Defer to allow click events on other items to commit first
-      setTimeout(() => {
-        const input = document.getElementById('sidebarNewTagInput');
-        const btn = document.getElementById('sidebarNewTagBtn');
-        if (input && !input.hidden) {
-          input.hidden = true;
-          if (btn) btn.hidden = false;
-        }
-      }, 100);
+      setTimeout(() => { input.hidden = true; }, 100);
+    }
+  });
+}
+
+// ─── Tag column wiring (table header + sidebar "New column") ─────────────────
+
+async function finishColumnRename(input, save) {
+  const id = input.dataset.columnId;
+  if (editingColumnId !== id) return; // already committed (Enter, then blur)
+  editingColumnId = null;
+  if (document.activeElement === input) input.blur();
+  const name = input.value.trim();
+  if (save && name) await renameColumn(id, name);
+  await refreshAll();
+}
+
+function initTagColumns() {
+  document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-column-action]');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const action = btn.dataset.columnAction;
+    const id = btn.dataset.columnId;
+
+    if (action === 'add') {
+      // New column starts in rename mode, like Notion.
+      editingColumnId = await createColumn('Untitled');
+      await refreshAll();
+      return;
+    }
+    if (action === 'rename') {
+      editingColumnId = id;
+      await refreshAll();
+      return;
+    }
+    if (action === 'delete') {
+      const { tags, columns } = await getTagModel();
+      const col = columns[id];
+      if (!col) return;
+      const n = Object.values(tags).filter(t => t.columnId === id).length;
+      const msg = n === 0
+        ? `Delete column "${col.name}"?`
+        : `Delete column "${col.name}" and its ${n} tag${n === 1 ? '' : 's'}? The papers themselves stay.`;
+      if (!window.confirm(msg)) return;
+      const removed = await deleteColumn(id);
+      for (const tagId of removed) activeFilter.tagIds.delete(tagId);
+      if (activeFilter.type === 'tag' && activeFilter.tagIds.size === 0) activeFilter.type = 'all';
+      if (tagPickerColumnId === id) closeTagPicker();
+      await refreshAll();
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    const input = e.target;
+    if (!input || !input.classList || !input.classList.contains('tag-col-name-input')) return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      finishColumnRename(input, true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finishColumnRename(input, false);
+    }
+  });
+
+  document.addEventListener('focusout', (e) => {
+    const input = e.target;
+    if (input && input.classList && input.classList.contains('tag-col-name-input')) {
+      finishColumnRename(input, true);
     }
   });
 }
@@ -1532,12 +1913,16 @@ function init() {
   const date = document.getElementById('dateDisplay');
   if (greeting) greeting.textContent = getGreeting();
   if (date) date.textContent = getDateDisplay();
+  applyColumnLayout();
+  loadColumnWidths().then(applyColumnLayout);
   renderLibrary();
   renderSidebar();
   initSidebar();
   initSettingsMenu();
   initSelectionBar();
   initTagPicker();
+  initTagColumns();
+  initColumnResize();
 
   // Ask the service worker to scan all currently-open tabs and add any
   // papers we don't have yet. Storage.onChanged will trigger a re-render
