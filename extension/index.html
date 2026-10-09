@@ -77,12 +77,11 @@
       <div class="paper-table-inner">
         <div class="paper-list-header" id="paperListHeader">
           <button class="paper-select-all-checkbox" id="selectAllCheckbox" title="Select all" aria-label="Select all"></button>
-          <div class="paper-col-label paper-col-head">Title<div class="col-resizer" data-resize-col="title" title="Drag to resize · double-click to reset"></div></div>
-          <div class="paper-col-label paper-col-head">Authors<div class="col-resizer" data-resize-col="authors" title="Drag to resize · double-click to reset"></div></div>
-          <div class="paper-col-label paper-col-head">Year<div class="col-resizer" data-resize-col="year" title="Drag to resize · double-click to reset"></div></div>
-          <div class="paper-col-label paper-col-head">Note<div class="col-resizer" data-resize-col="note" title="Drag to resize · double-click to reset"></div></div>
-          <!-- One header cell per tag column, rendered by app.js -->
-          <div class="tag-col-headers" id="tagColumnHeaders"></div>
+          <div class="paper-col-label paper-col-head paper-col-head-title">Title<div class="col-resizer" data-resize-col="title" title="Drag to resize · double-click to reset"></div></div>
+          <div class="paper-col-label paper-col-head paper-col-head-figure">Figure<div class="col-resizer" data-resize-col="figure" title="Drag to resize · double-click to reset"></div></div>
+          <!-- Header cells for every other column (Authors, Year, Note, tag
+               columns) in the user's order, rendered by app.js -->
+          <div class="col-headers" id="columnHeaders"></div>
           <div class="add-tag-col-cell">
             <button class="add-tag-col-btn" data-column-action="add" title="Add a tag column">+ Column</button>
           </div>

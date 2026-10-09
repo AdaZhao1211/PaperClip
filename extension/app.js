@@ -14,6 +14,7 @@ const TAGS_KEY = 'tags';
 const TAG_COLUMNS_KEY = 'tagColumns';
 const DEFAULT_COLUMN_ID = 'default';
 const COLUMN_WIDTHS_KEY = 'columnWidths';
+const COLUMN_ORDER_KEY = 'columnOrder';
 const CAPTURE_MODE_KEY = 'captureMode';
 
 const SOURCE_LABELS = {
@@ -196,8 +197,16 @@ async function deleteTagById(id) {
 // shows the subset that belongs to it.
 
 function sortedColumns(columns) {
+  // The user's drag-and-drop order (columnOrder) wins; columns it doesn't
+  // mention yet (e.g. just created) fall back to creation order.
+  const pos = id => {
+    const i = columnOrder.indexOf(id);
+    return i < 0 ? Infinity : i;
+  };
   return Object.values(columns).sort((a, b) =>
-    (a.order || 0) - (b.order || 0) || (a.createdAt || '').localeCompare(b.createdAt || '')
+    (pos(a.id) - pos(b.id)) ||
+    (a.order || 0) - (b.order || 0) ||
+    (a.createdAt || '').localeCompare(b.createdAt || '')
   );
 }
 
@@ -349,6 +358,56 @@ function sortPapers(list) {
   });
 }
 
+// ─── First figures ────────────────────────────────────────────────────────────
+//
+// When a paper is saved manually, the service worker crops the PDF's first
+// figure and stores it as a JPEG data URL under its own key (paper.figureKey).
+// Figures are loaded lazily into this cache, keyed by storage key.
+
+const figureCache = new Map(); // figureKey → data URL | null
+
+async function loadFigures(papers) {
+  const keys = papers.map(p => p.figureKey).filter(k => k && !figureCache.has(k));
+  if (!keys.length) return;
+  const store = await chrome.storage.local.get(keys);
+  for (const k of keys) figureCache.set(k, store[k] || null);
+}
+
+function renderFigureCell(p) {
+  const url = p.figureKey ? figureCache.get(p.figureKey) : null;
+  let inner;
+  if (url) {
+    const where = p.figurePage ? ` (page ${p.figurePage})` : '';
+    inner = `
+        <button class="paper-figure-btn" data-action="view-figure" title="First figure${where} — click to enlarge">
+          <img class="paper-figure-img" src="${escapeHtml(url)}" alt="First figure of the paper">
+        </button>`;
+  } else if (p.figureStatus === 'pending') {
+    inner = '<span class="paper-figure-status">Extracting…</span>';
+  } else {
+    const why = p.figureNote || (p.figureStatus ? '' : 'Figures are extracted when you save a paper with the toolbar icon');
+    inner = `<span class="paper-empty-cell"${why ? ` title="${escapeHtml(why)}"` : ''}>—</span>`;
+  }
+  return `<div class="paper-col-figure">${inner}</div>`;
+}
+
+let figureLightbox = null;
+
+function openFigureLightbox(src) {
+  if (!figureLightbox) {
+    figureLightbox = document.createElement('div');
+    figureLightbox.className = 'figure-lightbox';
+    figureLightbox.innerHTML = '<img class="figure-lightbox-img" alt="First figure of the paper">';
+    figureLightbox.addEventListener('click', () => { figureLightbox.hidden = true; });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !figureLightbox.hidden) figureLightbox.hidden = true;
+    });
+    document.body.appendChild(figureLightbox);
+  }
+  figureLightbox.querySelector('img').src = src;
+  figureLightbox.hidden = false;
+}
+
 // ─── Expanded-row state ──────────────────────────────────────────────────────
 
 const expandedIds = new Set();
@@ -428,7 +487,7 @@ function renderDetail(p) {
 
 function renderTagCell(p, column, tagObjs) {
   return `
-      <div class="paper-col-tags">
+      <div class="paper-col-tags" data-col-key="${escapeHtml(column.id)}">
         <button class="paper-tags-btn"
                 data-action="edit-tags"
                 data-paper-id="${escapeHtml(p.id)}"
@@ -448,7 +507,7 @@ function renderTagCell(p, column, tagObjs) {
       </div>`;
 }
 
-function renderRow(p, openMap, tagsById, columns) {
+function renderRow(p, openMap, tagsById, columns, columnKeys) {
   const open = openMap.get(p.id);
   const isOpen = !!open;
 
@@ -481,6 +540,24 @@ function renderRow(p, openMap, tagsById, columns) {
     }
   }
 
+  // Cells after the title, keyed so they can be laid out in the user's
+  // column order.
+  const cells = {
+    authors: `
+      <div class="paper-col-authors" data-col-key="authors">${authorsStr ? escapeHtml(authorsStr) : '<span class="paper-empty-cell">—</span>'}</div>`,
+    year: `
+      <div class="paper-col-year" data-col-key="year">${p.year ? escapeHtml(String(p.year)) : '<span class="paper-empty-cell">—</span>'}</div>`,
+    note: `
+      <div class="paper-col-note" data-col-key="note">
+        <textarea class="paper-note-input"
+                  data-paper-id="${escapeHtml(p.id)}"
+                  placeholder="Add a note…">${escapeHtml(p.note || '')}</textarea>
+      </div>`,
+  };
+  for (const col of columns) {
+    cells[col.id] = renderTagCell(p, col, tagObjs.filter(t => t.columnId === col.id));
+  }
+
   const isExpanded = expandedIds.has(p.id);
   const isStarred = !!p.starred;
   const isSelected = selectedIds.has(p.id);
@@ -511,14 +588,8 @@ function renderRow(p, openMap, tagsById, columns) {
         <div class="paper-title"><span class="paper-title-text">${escapeHtml(title)}</span></div>
         <div class="paper-sub">${subParts.join(' · ')}</div>
       </div>
-      <div class="paper-col-authors">${authorsStr ? escapeHtml(authorsStr) : '<span class="paper-empty-cell">—</span>'}</div>
-      <div class="paper-col-year">${p.year ? escapeHtml(String(p.year)) : '<span class="paper-empty-cell">—</span>'}</div>
-      <div class="paper-col-note">
-        <textarea class="paper-note-input"
-                  data-paper-id="${escapeHtml(p.id)}"
-                  placeholder="Add a note…">${escapeHtml(p.note || '')}</textarea>
-      </div>
-      ${columns.map(col => renderTagCell(p, col, tagObjs.filter(t => t.columnId === col.id))).join('')}
+      ${renderFigureCell(p)}
+      ${columnKeys.map(key => cells[key] || '').join('')}
       <div class="paper-actions">
         <button class="paper-icon-btn paper-star-btn"
                 data-action="toggle-star"
@@ -655,35 +726,62 @@ async function renderSidebar() {
 // Column currently being renamed inline in the table header, if any.
 let editingColumnId = null;
 
-// ─── Column widths ────────────────────────────────────────────────────────────
+// ─── Column layout: widths and order ──────────────────────────────────────────
+//
+// Columns are identified by a key: 'title' | 'authors' | 'year' | 'note' | a
+// tag column id.
 //
 // Every column can be resized by dragging the right edge of its header.
-// columnWidths maps a column key ('title' | 'authors' | 'year' | 'note' | a tag
-// column id) to a fixed pixel width. Columns without an entry keep their
-// flexible default track.
+// columnWidths maps a key to a fixed pixel width; columns without an entry
+// keep their flexible default track.
+//
+// Every column except the (frozen) title can be moved by dragging its header.
+// columnOrder lists the movable keys in display order; keys it doesn't
+// mention (e.g. a new tag column) go at the end.
 
-const FIXED_COLUMNS = [
-  { key: 'title',   track: 'minmax(150px, 1fr)',   min: 150 },
-  { key: 'authors', track: 'minmax(80px, 0.7fr)',  min: 80 },
-  { key: 'year',    track: '56px',                 min: 56 },
-  { key: 'note',    track: 'minmax(200px, 1fr)',   min: 200 },
-];
+const COLUMN_DEFS = {
+  title:   { track: 'minmax(150px, 1fr)',  min: 150 },
+  figure:  { track: '120px',               min: 120 },
+  authors: { track: 'minmax(80px, 0.7fr)', min: 80,  label: 'Authors' },
+  year:    { track: '56px',                min: 56,  label: 'Year' },
+  note:    { track: 'minmax(200px, 1fr)',  min: 200, label: 'Note' },
+};
+const MOVABLE_FIXED_KEYS = ['authors', 'year', 'note'];
 const TAG_COLUMN_TRACK = { track: 'minmax(140px, 0.6fr)', min: 140 };
-const MIN_RESIZE_WIDTH = { title: 120, authors: 60, year: 40, note: 80, tag: 80 };
+const MIN_RESIZE_WIDTH = { title: 120, figure: 60, authors: 60, year: 40, note: 80, tag: 80 };
 const GRID_GAP = 14;
 const GRID_EDGE = 18 + 92 + 28; // select column + actions column + row padding
 
 let columnWidths = {};
+let columnOrder = [];
 let currentTagColumns = [];
 
-async function loadColumnWidths() {
-  const store = await chrome.storage.local.get(COLUMN_WIDTHS_KEY);
+async function loadColumnLayout() {
+  const store = await chrome.storage.local.get([COLUMN_WIDTHS_KEY, COLUMN_ORDER_KEY]);
   columnWidths = store[COLUMN_WIDTHS_KEY] || {};
+  columnOrder = Array.isArray(store[COLUMN_ORDER_KEY]) ? store[COLUMN_ORDER_KEY] : [];
+}
+
+/** Movable column keys (everything after the title) in display order. */
+function orderedColumnKeys() {
+  const defaults = [...MOVABLE_FIXED_KEYS, ...currentTagColumns.map(c => c.id)];
+  const known = new Set(defaults);
+  const saved = columnOrder.filter(k => known.has(k));
+  return [...saved, ...defaults.filter(k => !saved.includes(k))];
+}
+
+async function saveColumnOrder(keys) {
+  columnOrder = keys;
+  // Mirror the tag columns' relative order into their `order` field so the
+  // sidebar and exports agree with the table.
+  const { columns } = await getTagModel();
+  keys.filter(k => columns[k]).forEach((k, i) => { columns[k].order = i; });
+  await chrome.storage.local.set({ [COLUMN_ORDER_KEY]: keys, [TAG_COLUMNS_KEY]: columns });
 }
 
 function saveColumnWidths() {
   // Drop widths for tag columns that no longer exist.
-  const live = new Set([...FIXED_COLUMNS.map(c => c.key), ...currentTagColumns.map(c => c.id)]);
+  const live = new Set(['title', 'figure', ...orderedColumnKeys()]);
   for (const key of Object.keys(columnWidths)) {
     if (!live.has(key)) delete columnWidths[key];
   }
@@ -697,8 +795,9 @@ function saveColumnWidths() {
  */
 function applyColumnLayout() {
   const cols = [
-    ...FIXED_COLUMNS,
-    ...currentTagColumns.map(c => ({ key: c.id, ...TAG_COLUMN_TRACK })),
+    { key: 'title', ...COLUMN_DEFS.title },
+    { key: 'figure', ...COLUMN_DEFS.figure },
+    ...orderedColumnKeys().map(key => ({ key, ...(COLUMN_DEFS[key] || TAG_COLUMN_TRACK) })),
   ];
   const tracks = cols.map(c => columnWidths[c.key] ? `${columnWidths[c.key]}px` : c.track);
   const minWidth = GRID_EDGE
@@ -709,6 +808,176 @@ function applyColumnLayout() {
   rootStyle.setProperty('--paper-grid-columns', `18px ${tracks.join(' ')} 92px`);
   rootStyle.setProperty('--paper-table-min-width', `${minWidth}px`);
   rootStyle.setProperty('--tag-col-count', String(currentTagColumns.length));
+}
+
+// ─── Column reordering ────────────────────────────────────────────────────────
+//
+// Hold a column header and drag it sideways to move the column. A drag only
+// starts after the pointer moves a few pixels, so a plain click on a tag
+// column's name still renames it. Near the table's edges the table scrolls
+// so columns can be moved past the visible area.
+
+const REORDER_THRESHOLD = 5;
+const REORDER_EDGE = 48;      // px from the visible edge that triggers scrolling
+const REORDER_SCROLL_STEP = 14;
+
+function initColumnReorder() {
+  const table = document.querySelector('.paper-table');
+  const inner = document.querySelector('.paper-table-inner');
+  if (!table || !inner) return;
+
+  let drag = null;           // { key, startX, x, y, started, ghost, indicator, targetIndex }
+  let suppressClick = false;
+
+  const headerCells = () => [...document.querySelectorAll('#columnHeaders [data-col-key]')];
+  // Right edge of the frozen columns (title + figure).
+  const titleRight = () => {
+    const t = document.querySelector('.paper-col-head-figure');
+    return t ? t.getBoundingClientRect().right : table.getBoundingClientRect().left;
+  };
+
+  function markDragged(on) {
+    document.querySelectorAll(`[data-col-key="${CSS.escape(drag.key)}"]`)
+      .forEach(el => el.classList.toggle('is-col-dragging', on));
+  }
+
+  // Insertion index among the header cells for the pointer's x, plus the x
+  // where the drop indicator goes (the middle of the gap).
+  function dropTarget(x) {
+    const cells = headerCells();
+    const half = GRID_GAP / 2;
+    for (let i = 0; i < cells.length; i++) {
+      const r = cells[i].getBoundingClientRect();
+      if (x < r.left + r.width / 2) {
+        // Columns hidden under the frozen columns: show the line at their edge.
+        return { index: i, lineX: Math.max(r.left - half, titleRight() + half) };
+      }
+    }
+    const last = cells[cells.length - 1].getBoundingClientRect();
+    return { index: cells.length, lineX: last.right + half };
+  }
+
+  function updateTarget() {
+    const { index, lineX } = dropTarget(drag.x);
+    drag.targetIndex = index;
+    drag.indicator.style.left = `${lineX - inner.getBoundingClientRect().left}px`;
+    drag.ghost.style.left = `${drag.x}px`;
+    drag.ghost.style.top = `${drag.y}px`;
+  }
+
+  function startDrag() {
+    drag.started = true;
+    const cell = headerCells().find(c => c.dataset.colKey === drag.key);
+    drag.ghost = document.createElement('div');
+    drag.ghost.className = 'col-drag-ghost';
+    drag.ghost.textContent = cell ? cell.textContent.trim() : '';
+    document.body.appendChild(drag.ghost);
+    drag.indicator = document.createElement('div');
+    drag.indicator.className = 'col-drop-indicator';
+    inner.appendChild(drag.indicator);
+    document.body.classList.add('is-reordering-col');
+    markDragged(true);
+    autoScroll();
+  }
+
+  // While dragging, scroll the table when the pointer sits near an edge.
+  function autoScroll() {
+    if (!drag || !drag.started) return;
+    const r = table.getBoundingClientRect();
+    let dx = 0;
+    if (drag.x > r.right - REORDER_EDGE) dx = REORDER_SCROLL_STEP;
+    else if (drag.x < titleRight() + REORDER_EDGE) dx = -REORDER_SCROLL_STEP;
+    if (dx) table.scrollLeft += dx;
+    updateTarget();
+    requestAnimationFrame(autoScroll);
+  }
+
+  function endDrag(commit) {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    if (!d.started) return;   // was just a click
+    d.ghost.remove();
+    d.indicator.remove();
+    document.body.classList.remove('is-reordering-col');
+    document.querySelectorAll('.is-col-dragging').forEach(el => el.classList.remove('is-col-dragging'));
+    // The click that follows pointerup must not trigger rename etc.
+    suppressClick = true;
+    setTimeout(() => { suppressClick = false; }, 0);
+    if (!commit) return;
+
+    const keys = orderedColumnKeys();
+    const from = keys.indexOf(d.key);
+    let to = d.targetIndex;
+    if (from < 0) return;
+    if (to > from) to -= 1;
+    if (to === from) return;
+    keys.splice(from, 1);
+    keys.splice(to, 0, d.key);
+    columnOrder = keys;
+    refreshAll();
+    saveColumnOrder(keys);
+  }
+
+  document.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const cell = e.target.closest('#columnHeaders [data-col-key]');
+    if (!cell) return;
+    // Resizing and the delete button have their own handling; the rename
+    // input needs normal text selection.
+    if (e.target.closest('.col-resizer, .tag-col-action, input')) return;
+    drag = { key: cell.dataset.colKey, startX: e.clientX, x: e.clientX, y: e.clientY, started: false };
+  });
+
+  document.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    drag.x = e.clientX;
+    drag.y = e.clientY;
+    if (!drag.started) {
+      if (Math.abs(e.clientX - drag.startX) < REORDER_THRESHOLD) return;
+      startDrag();
+    }
+    e.preventDefault();
+    updateTarget();
+  });
+
+  document.addEventListener('pointerup', () => endDrag(true));
+  document.addEventListener('pointercancel', () => endDrag(false));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && drag && drag.started) endDrag(false);
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
+}
+
+// The title and figure columns and the header row are frozen with CSS
+// position: sticky. JS only tracks when the table is scrolled sideways (for
+// the edge shadow), the visible width (so expanded details can stay in
+// view), the title column's width (the figure column is pinned just right of
+// it), and the table's offset from the top of the page (so it can end at the
+// bottom of the window).
+function initFrozenColumn() {
+  const table = document.querySelector('.paper-table');
+  const titleHead = document.querySelector('.paper-col-head-title');
+  if (!table) return;
+  const rootStyle = document.documentElement.style;
+  const update = () => {
+    table.classList.toggle('is-scrolled-x', table.scrollLeft > 0);
+    rootStyle.setProperty('--paper-table-viewport', `${table.clientWidth}px`);
+    if (titleHead) rootStyle.setProperty('--title-col-width', `${titleHead.getBoundingClientRect().width}px`);
+    rootStyle.setProperty('--paper-table-top', `${table.getBoundingClientRect().top + window.scrollY}px`);
+  };
+  table.addEventListener('scroll', update, { passive: true });
+  window.addEventListener('resize', update);
+  const ro = new ResizeObserver(update);
+  ro.observe(table);
+  if (titleHead) ro.observe(titleHead);
+  update();
 }
 
 function initColumnResize() {
@@ -767,8 +1036,12 @@ function initColumnResize() {
   }, true);
 }
 
-function renderTagColumnHeaders(columns) {
-  const wrap = document.getElementById('tagColumnHeaders');
+const RESIZER_HTML = key =>
+  `<div class="col-resizer" data-resize-col="${escapeHtml(key)}" title="Drag to resize · double-click to reset"></div>`;
+
+/** Header cells for every column after the title, in the user's order. */
+function renderColumnHeaders(columns) {
+  const wrap = document.getElementById('columnHeaders');
   if (!wrap) return;
   currentTagColumns = columns;
   applyColumnLayout();
@@ -776,21 +1049,27 @@ function renderTagColumnHeaders(columns) {
   const active = document.activeElement;
   if (active && active.classList.contains('tag-col-name-input') && wrap.contains(active)) return;
 
-  wrap.innerHTML = columns.map(col => {
+  const tagColumnsById = Object.fromEntries(columns.map(c => [c.id, c]));
+  wrap.innerHTML = orderedColumnKeys().map(key => {
+    const col = tagColumnsById[key];
+    if (!col) {
+      return `
+      <div class="paper-col-label paper-col-head" data-col-key="${key}" title="Drag to move">${COLUMN_DEFS[key].label}${RESIZER_HTML(key)}</div>`;
+    }
     const id = escapeHtml(col.id);
     if (col.id === editingColumnId) {
       return `
-        <div class="tag-col-header" data-column-id="${id}">
+        <div class="tag-col-header" data-col-key="${id}" data-column-id="${id}">
           <input class="tag-col-name-input" data-column-id="${id}" type="text" value="${escapeHtml(col.name)}" aria-label="Column name">
         </div>`;
     }
     return `
-      <div class="tag-col-header" data-column-id="${id}">
+      <div class="tag-col-header" data-col-key="${id}" data-column-id="${id}">
         <button class="paper-col-label tag-col-name"
                 data-column-action="rename"
                 data-column-id="${id}"
-                title="Rename column">${escapeHtml(col.name)}</button>
-        <div class="col-resizer" data-resize-col="${id}" title="Drag to resize · double-click to reset"></div>
+                title="Click to rename · drag to move">${escapeHtml(col.name)}</button>
+        ${RESIZER_HTML(col.id)}
         <button class="tag-col-action"
                 data-column-action="delete"
                 data-column-id="${id}"
@@ -824,7 +1103,8 @@ async function renderLibrary(filter = '') {
   ]);
   const all = Object.values(papers);
   const columns = sortedColumns(columnsById);
-  renderTagColumnHeaders(columns);
+  renderColumnHeaders(columns);
+  const columnKeys = orderedColumnKeys();
 
   const q = filter.trim().toLowerCase();
   let filtered = q ? all.filter(p => paperMatchesFilter(p, q, tags)) : all;
@@ -857,7 +1137,8 @@ async function renderLibrary(filter = '') {
   countEl.textContent = isFiltered
     ? `${sorted.length} of ${all.length}`
     : `${all.length} paper${all.length === 1 ? '' : 's'}`;
-  list.innerHTML = sorted.map(p => renderRow(p, openMap, tags, columns)).join('');
+  await loadFigures(sorted);
+  list.innerHTML = sorted.map(p => renderRow(p, openMap, tags, columns, columnKeys)).join('');
 
   // Drop selections that no longer exist (e.g. after delete)
   const valid = new Set(all.map(p => p.id));
@@ -990,7 +1271,9 @@ async function deleteSelected() {
     console.warn('[paperclip] could not close tabs for selected', err);
   }
 
+  const figureKeys = ids.map(id => papers[id] && papers[id].figureKey).filter(Boolean);
   for (const id of ids) delete papers[id];
+  if (figureKeys.length) chrome.storage.local.remove(figureKeys);
   await chrome.storage.local.set({ [PAPERS_KEY]: papers });
 
   selectedIds.clear();
@@ -1076,8 +1359,10 @@ async function deletePaper(id) {
     console.warn('[paperclip] could not close tabs for', id, err);
   }
 
+  const figureKey = paper.figureKey;
   delete papers[id];
   await chrome.storage.local.set({ [PAPERS_KEY]: papers });
+  if (figureKey) await chrome.storage.local.remove(figureKey);
 }
 
 document.addEventListener('click', async (e) => {
@@ -1104,6 +1389,11 @@ document.addEventListener('click', async (e) => {
     const row = actionBtn.closest('.paper-row');
     if (!row) return;
 
+    if (action === 'view-figure') {
+      const img = actionBtn.querySelector('img');
+      if (img) openFigureLightbox(img.src);
+      return;
+    }
     if (action === 'toggle-star') {
       const id = row.dataset.id;
       if (!id) return;
@@ -1251,7 +1541,18 @@ chrome.storage.onChanged.addListener((changes, area) => {
     columnWidths = changes[COLUMN_WIDTHS_KEY].newValue || {};
     applyColumnLayout();
   }
-  if (!changes[PAPERS_KEY] && !changes[TAGS_KEY] && !changes[TAG_COLUMNS_KEY]) return;
+  if (changes[COLUMN_ORDER_KEY]) {
+    columnOrder = changes[COLUMN_ORDER_KEY].newValue || [];
+  }
+  let figureChanged = false;
+  for (const [key, change] of Object.entries(changes)) {
+    if (key.startsWith('figure:')) {
+      figureCache.set(key, change.newValue || null);
+      figureChanged = true;
+    }
+  }
+  if (figureChanged) scheduleRender(150);
+  if (!changes[PAPERS_KEY] && !changes[TAGS_KEY] && !changes[TAG_COLUMNS_KEY] && !changes[COLUMN_ORDER_KEY]) return;
   scheduleRender(150);
 });
 
@@ -1711,11 +2012,13 @@ function initTagPicker() {
   window.addEventListener('resize', () => {
     if (tagPickerEl && !tagPickerEl.hidden) closeTagPicker();
   });
-  window.addEventListener('scroll', () => {
+  // Capture phase: also catches the paper table's own scrolling, since
+  // element scroll events don't bubble.
+  document.addEventListener('scroll', () => {
     if (tagPickerEl && !tagPickerEl.hidden && tagPickerAnchor) {
       positionTagPicker(tagPickerEl, tagPickerAnchor);
     }
-  }, { passive: true });
+  }, { capture: true, passive: true });
 }
 
 // ─── Sidebar wiring ───────────────────────────────────────────────────────────
@@ -1930,16 +2233,20 @@ function init() {
   const date = document.getElementById('dateDisplay');
   if (greeting) greeting.textContent = getGreeting();
   if (date) date.textContent = getDateDisplay();
-  applyColumnLayout();
-  loadColumnWidths().then(applyColumnLayout);
-  renderLibrary();
-  renderSidebar();
+  // Load saved widths / order first so the first render is already in the
+  // user's layout.
+  loadColumnLayout().then(() => {
+    renderLibrary();
+    renderSidebar();
+  });
   initSidebar();
   initSettingsMenu();
   initSelectionBar();
   initTagPicker();
   initTagColumns();
   initColumnResize();
+  initColumnReorder();
+  initFrozenColumn();
 
   // Ask the service worker to scan all currently-open tabs and add any
   // papers we don't have yet. Storage.onChanged will trigger a re-render

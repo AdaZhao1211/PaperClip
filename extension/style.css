@@ -49,7 +49,9 @@ body::before {
   /* Grows with each extra tag column (--tag-col-count, set by app.js). */
   max-width: calc(1500px + max(0px, (var(--tag-col-count, 1) - 1) * 160px));
   margin: 0 auto;
-  padding: 48px 48px 80px;
+  /* Small bottom padding: the paper table ends at the bottom of the window
+     and scrolls itself (see .paper-table). */
+  padding: 48px 48px 24px;
   display: flex;
   gap: 36px;
   align-items: flex-start;
@@ -441,7 +443,7 @@ header {
    ============================================================ */
 
 .paper-library {
-  margin-bottom: 40px;
+  margin-bottom: 0;
 }
 
 /* ---- Search bar ---- */
@@ -612,8 +614,23 @@ header {
 /* ---- Table layout: select | title+sub | authors | year | note | tag columns… | actions ---- */
 /* When the window is too narrow for every tag column, the table scrolls
    sideways instead of squeezing the columns. */
+/* The table is its own scroll area in both directions, sized to end at the
+   bottom of the window. That lets the header row stay pinned while scrolling
+   down (a sticky header can't follow the page from inside a sideways
+   scroller) and keeps the sideways scrollbar in view. --paper-table-top is
+   the table's distance from the top of the page, set by app.js. */
 .paper-table {
-  overflow-x: auto;
+  overflow: auto;
+  max-height: max(260px, calc(100vh - var(--paper-table-top, 220px) - 24px));
+}
+
+/* Pinned header row. Its frozen cells (checkbox, title, figure) are also
+   pinned sideways, so the top-left corner never moves. */
+.paper-list-header {
+  position: sticky;
+  top: 0;
+  z-index: 7;   /* above the rows' frozen cells */
+  background: var(--paper);
 }
 
 .paper-table-inner {
@@ -631,6 +648,151 @@ header {
   );
   gap: 14px;
   align-items: center;
+}
+
+/* ---- Frozen columns ----
+   The select checkbox, title and figure stay pinned to the left edge while
+   the table scrolls sideways. Pinned cells need an opaque background, so each row
+   exposes its state tint as --row-tint and the pinned cells paint it over
+   the page color. */
+.paper-list-header,
+.paper-row { --row-tint: transparent; }
+.paper-row:hover { --row-tint: rgba(255, 253, 249, 0.7); }
+.paper-row.is-selected { --row-tint: rgba(200, 113, 58, 0.06); }
+.paper-row.is-expanded { --row-tint: rgba(255, 253, 249, 0.7); }
+
+.paper-select-checkbox,
+.paper-select-all-checkbox {
+  position: sticky;
+  left: 12px;   /* row's left padding */
+  z-index: 5;
+}
+
+.paper-main,
+.paper-col-head.paper-col-head-title { /* beats .paper-col-head { position: relative } */
+  position: sticky;
+  left: 44px;   /* padding 12 + checkbox 18 + gap 14 */
+  z-index: 4;
+  align-self: stretch;
+  background: linear-gradient(var(--row-tint), var(--row-tint)), var(--paper);
+  transition: box-shadow 0.15s;
+}
+
+/* Fill the strip left of the title (padding, checkbox, gap) so scrolled
+   cells don't show through behind the checkbox. */
+.paper-main::before,
+.paper-col-head-title::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -44px;
+  width: 44px;
+  background: inherit;
+}
+
+.paper-col-head-title {
+  display: flex;
+  align-items: center;
+}
+
+/* The figure column is pinned right after the title. --title-col-width is
+   the title column's current width, kept up to date by app.js. */
+.paper-col-figure,
+.paper-col-head.paper-col-head-figure {
+  position: sticky;
+  left: calc(44px + var(--title-col-width, 150px) + 14px);
+  z-index: 4;
+  align-self: stretch;
+  background: linear-gradient(var(--row-tint), var(--row-tint)), var(--paper);
+  transition: box-shadow 0.15s;
+}
+
+/* Fill the gap between title and figure. */
+.paper-col-figure::before,
+.paper-col-head-figure::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -14px;
+  width: 14px;
+  background: inherit;
+}
+
+.paper-col-head-figure {
+  display: flex;
+  align-items: center;
+}
+
+/* Edge shadow on the last frozen column once something is scrolled underneath. */
+.paper-table.is-scrolled-x .paper-col-figure,
+.paper-table.is-scrolled-x .paper-col-head-figure {
+  box-shadow: 10px 0 10px -10px rgba(26, 22, 19, 0.18);
+}
+
+/* ---- First-figure thumbnail ---- */
+.paper-col-figure {
+  min-width: 0;
+}
+
+.paper-figure-btn {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 1px solid var(--warm-gray);
+  border-radius: 6px;
+  background: #fff;
+  overflow: hidden;
+  cursor: zoom-in;
+  transition: border-color 0.15s;
+}
+
+.paper-figure-btn:hover {
+  border-color: var(--muted);
+}
+
+.paper-figure-img {
+  display: block;
+  width: 100%;
+  max-height: 96px;
+  object-fit: contain;
+}
+
+.paper-figure-status {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.figure-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: rgba(26, 22, 19, 0.6);
+  cursor: zoom-out;
+}
+
+.figure-lightbox[hidden] { display: none; }
+
+.figure-lightbox-img {
+  max-width: min(1100px, 100%);
+  max-height: 100%;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+
+/* Expanded details (abstract, links) stay in view instead of scrolling
+   off with the columns. --paper-table-viewport is set by app.js. */
+.paper-detail {
+  position: sticky;
+  left: 0;
+  width: var(--paper-table-viewport, auto);
 }
 
 /* ---- Column resize handles (right edge of each header cell) ---- */
@@ -672,9 +834,66 @@ body.is-resizing-col {
   user-select: none;
 }
 
-/* Header cells for tag columns are grid items of the header row itself. */
-.tag-col-headers {
+/* Movable header cells are grid items of the header row itself. */
+.col-headers {
   display: contents;
+}
+
+/* ---- Column reordering (hold a header and drag it sideways) ---- */
+.col-headers [data-col-key] {
+  cursor: grab;
+}
+
+.col-headers .tag-col-name {
+  cursor: grab;
+}
+
+body.is-reordering-col,
+body.is-reordering-col * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+
+/* The column being moved, in the header and every row */
+.is-col-dragging {
+  opacity: 0.35;
+}
+
+.paper-table-inner {
+  position: relative;
+}
+
+/* Where the column will land */
+.col-drop-indicator {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--accent-amber);
+  z-index: 8;   /* above the frozen columns and pinned header */
+  pointer-events: none;
+}
+
+/* Label that follows the pointer while dragging */
+.col-drag-ghost {
+  position: fixed;
+  z-index: 200;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: var(--card-bg);
+  border: 1px solid var(--accent-amber);
+  box-shadow: 0 6px 18px var(--shadow);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--ink);
+  pointer-events: none;
+  transform: translate(-50%, -130%);
+  white-space: nowrap;
 }
 
 .tag-col-header {
