@@ -663,24 +663,28 @@ chrome.action.onClicked.addListener(async (tab) => {
   const result = await capturePaper(tab, 'manual');
   updateTabBadge(tab);
   if (!result) return;
-  // Crop the paper's first figure now, while the click's activeTab grant
-  // lets us fetch the PDF (paywalled PDFs work too: the fetch carries the
-  // user's cookies). Re-clicking a saved paper retries a missing figure
-  // (including one stuck 'pending' if the worker was stopped mid-way).
-  const papers = (await chrome.storage.local.get(PAPERS_KEY))[PAPERS_KEY] || {};
-  const paper = papers[result.id];
-  if (paper && paper.figureStatus !== 'ok') {
-    scheduleFigureExtraction(tab.url, result.id);
-  }
+  // Process the PDF now, while the click's activeTab grant lets us fetch it
+  // (paywalled PDFs work too: the fetch carries the user's cookies): crop
+  // Figure 1 and save the PDF + title image to the library folder.
+  // Clicking a paper that's already saved redoes all of it — a fresh crop,
+  // and its files overwritten under the same names — leaving tags, notes
+  // and other library data untouched.
+  scheduleFigureExtraction(tab.url, result.id);
 });
 
-// ─── First-figure extraction (manual saves) ───────────────────────────────────
+// ─── Manual saves: first figure + files in the library folder ─────────────────
 //
 // The service worker fetches the PDF and parks it in Cache Storage; a hidden
-// offscreen document runs pdf.js on it (figure.js) and returns a JPEG data
-// URL of the first figure, stored under its own key ('figure:<paper id>') so
-// the papers map stays small. paper.figureStatus tracks progress:
-// 'pending' | 'ok' | 'none' (no raster figure found) | 'failed'.
+// offscreen document (offscreen.js) runs pdf.js on it to crop the first
+// figure, composes an image of the full title above that figure, and saves
+// the PDF and image into the user's library folder (library-folder.js).
+//
+// The figure thumbnail shown in the table is stored under its own key
+// ('figure:<paper id>') so the papers map stays small.
+//   paper.figureStatus: 'pending' | 'ok' | 'none' (no raster figure) | 'failed'
+//   paper.filesStatus:  'saved' | 'pending' (waiting for folder access) |
+//                       'no-folder' | 'failed'
+//   paper.files:        { pdf, image } file names in the folder
 
 const FIGURE_CACHE = 'paperclip-pdf';
 const MAX_PDF_BYTES = 120 * 1024 * 1024;
@@ -721,6 +725,30 @@ async function ensureOffscreenDocument() {
   });
 }
 
+/**
+ * True when the paper's title is a stand-in (its URL, a file name, or
+ * "arXiv:2401.12345") rather than the real title.
+ */
+function hasPlaceholderTitle(paper) {
+  const t = (paper.title || '').trim();
+  if (!t || looksLikeUrlOrFilename(t) || /\.pdf$/i.test(t)) return true;
+  const label = SOURCE_LABELS[paper.source] || paper.source;
+  return !!paper.sourceId && t === `${label}:${paper.sourceId}`;
+}
+
+/**
+ * The paper once its metadata lookup (which finds the real title) has
+ * finished, or after `timeoutMs`. Reading storage keeps the worker alive.
+ */
+async function paperAfterEnrichment(paperId, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const paper = ((await chrome.storage.local.get(PAPERS_KEY))[PAPERS_KEY] || {})[paperId];
+    if (!paper || paper.enrichmentStatus !== 'pending' || Date.now() > deadline) return paper;
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+
 async function extractFigure(pdfUrl, paperId) {
   await patchStoredPaper(paperId, p => { p.figureStatus = 'pending'; delete p.figureNote; });
   const cacheKey = `https://paperclip.invalid/pdf/${encodeURIComponent(paperId)}`;
@@ -736,26 +764,43 @@ async function extractFigure(pdfUrl, paperId) {
     }
     await cache.put(cacheKey, new Response(buf, { headers: { 'Content-Type': 'application/pdf' } }));
 
+    // The title goes on the saved image and names the files, so wait for the
+    // metadata lookup to find the real one. If it can't, the offscreen page
+    // reads the title from the PDF itself.
+    const paper = await paperAfterEnrichment(paperId);
+    if (!paper) return; // deleted meanwhile
+
     await ensureOffscreenDocument();
     const res = await chrome.runtime.sendMessage({
-      target: 'offscreen', type: 'extract-figure', cacheName: FIGURE_CACHE, cacheKey,
+      target: 'offscreen',
+      type: 'process-paper',
+      cacheName: FIGURE_CACHE,
+      cacheKey,
+      paperId,
+      title: hasPlaceholderTitle(paper) ? '' : paper.title,
+      fallbackTitle: paper.title,
+      files: paper.files || null,
     });
-    if (!res || !res.ok) throw new Error((res && res.error) || 'Figure extraction failed');
+    if (!res || !res.ok) throw new Error((res && res.error) || 'PDF processing failed');
 
-    if (!res.figure) {
-      await patchStoredPaper(paperId, p => {
-        p.figureStatus = 'none';
-        p.figureNote = 'No image found in the first pages of the PDF';
-      });
-      return;
-    }
     const figureKey = `figure:${paperId}`;
-    await chrome.storage.local.set({ [figureKey]: res.figure.dataUrl });
+    if (res.figure) await chrome.storage.local.set({ [figureKey]: res.figure.dataUrl });
     await patchStoredPaper(paperId, p => {
-      p.figureKey = figureKey;
-      p.figureStatus = 'ok';
-      p.figurePage = res.figure.page;
-      delete p.figureNote;
+      if (res.figure) {
+        p.figureKey = figureKey;
+        p.figureStatus = 'ok';
+        p.figurePage = res.figure.page;
+        delete p.figureNote;
+      } else {
+        p.figureStatus = 'none';
+        p.figureNote = 'No Figure 1 found in the first pages of the PDF';
+      }
+      // A title read from the PDF beats a placeholder like the file name.
+      if (res.title && hasPlaceholderTitle(p)) p.title = res.title;
+      if (res.files) p.files = res.files;
+      p.filesStatus = res.filesStatus;
+      if (res.filesNote) p.filesNote = res.filesNote;
+      else delete p.filesNote;
     });
   } catch (err) {
     console.warn('[paperclip] figure extraction failed', paperId, err);
@@ -772,13 +817,20 @@ async function extractFigure(pdfUrl, paperId) {
 // pdf.js's memory.
 let figureChain = Promise.resolve();
 let figureJobs = 0;
+const figureQueued = new Set(); // paper ids waiting to be processed
 
 function scheduleFigureExtraction(tabUrl, paperId) {
+  // Repeated clicks while a paper is still waiting don't queue it again.
+  if (figureQueued.has(paperId)) return;
   let pdfUrl;
   try { pdfUrl = pdfUrlForTab(tabUrl); } catch { return; }
+  figureQueued.add(paperId);
   figureJobs++;
   figureChain = figureChain
-    .then(() => extractFigure(pdfUrl, paperId))
+    .then(() => {
+      figureQueued.delete(paperId);
+      return extractFigure(pdfUrl, paperId);
+    })
     .finally(async () => {
       if (--figureJobs === 0) {
         try { await chrome.offscreen.closeDocument(); } catch {}

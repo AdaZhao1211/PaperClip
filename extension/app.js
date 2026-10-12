@@ -360,9 +360,11 @@ function sortPapers(list) {
 
 // ─── First figures ────────────────────────────────────────────────────────────
 //
-// When a paper is saved manually, the service worker crops the PDF's first
-// figure and stores it as a JPEG data URL under its own key (paper.figureKey).
-// Figures are loaded lazily into this cache, keyed by storage key.
+// When a paper is saved manually, the PDF's Figure 1 is cropped and composed
+// under the paper's full title into a PNG — the same image that's saved in
+// the library folder. The table shows a small JPEG thumbnail of it, stored
+// under its own key (paper.figureKey); the enlarged view loads the full PNG.
+// Thumbnails are loaded lazily into this cache, keyed by storage key.
 
 const figureCache = new Map(); // figureKey → data URL | null
 
@@ -379,8 +381,8 @@ function renderFigureCell(p) {
   if (url) {
     const where = p.figurePage ? ` (page ${p.figurePage})` : '';
     inner = `
-        <button class="paper-figure-btn" data-action="view-figure" title="First figure${where} — click to enlarge">
-          <img class="paper-figure-img" src="${escapeHtml(url)}" alt="First figure of the paper">
+        <button class="paper-figure-btn" data-action="view-figure" title="Figure 1${where} — click to enlarge">
+          <img class="paper-figure-img" src="${escapeHtml(url)}" alt="Paper title and Figure 1">
         </button>`;
   } else if (p.figureStatus === 'pending') {
     inner = '<span class="paper-figure-status">Extracting…</span>';
@@ -392,12 +394,39 @@ function renderFigureCell(p) {
 }
 
 let figureLightbox = null;
+let figureLightboxUrl = null;
+
+/**
+ * The full title + figure PNG: the copy kept by the extension, else the file
+ * in the library folder (e.g. after an import), else null.
+ */
+async function fullFigureImage(paper) {
+  const lf = await libraryFolder();
+  const kept = await lf.getFigureImage(paper.id);
+  if (kept) return kept;
+  if (paper.files && paper.files.image) {
+    const dir = await lf.writableFolder();
+    if (dir) return lf.readFile(dir, paper.files.image);
+  }
+  return null;
+}
+
+/** Show the thumbnail right away, then swap in the full-resolution image. */
+async function showFigure(paperId, thumbSrc) {
+  openFigureLightbox(thumbSrc);
+  const paper = (await getPapers())[paperId];
+  const blob = paper && await fullFigureImage(paper);
+  if (!blob || figureLightbox.hidden) return;
+  if (figureLightboxUrl) URL.revokeObjectURL(figureLightboxUrl);
+  figureLightboxUrl = URL.createObjectURL(blob);
+  figureLightbox.querySelector('img').src = figureLightboxUrl;
+}
 
 function openFigureLightbox(src) {
   if (!figureLightbox) {
     figureLightbox = document.createElement('div');
     figureLightbox.className = 'figure-lightbox';
-    figureLightbox.innerHTML = '<img class="figure-lightbox-img" alt="First figure of the paper">';
+    figureLightbox.innerHTML = '<img class="figure-lightbox-img" alt="Paper title and Figure 1">';
     figureLightbox.addEventListener('click', () => { figureLightbox.hidden = true; });
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && !figureLightbox.hidden) figureLightbox.hidden = true;
@@ -476,11 +505,26 @@ function renderDetail(p) {
         ${abstractHtml}
       </div>
       ${attachmentsHtml}
+      ${renderFilesDetail(p)}
       <div class="paper-detail-row paper-detail-row-block">
         <a class="paper-detail-link" href="${escapeHtml(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.url)}</a>
       </div>
     </div>
   `;
+}
+
+/** "Files" row in the expanded details: what was saved to the library folder. */
+function renderFilesDetail(p) {
+  if (!p.filesStatus) return '';
+  const names = p.files ? [p.files.pdf, p.files.image].filter(Boolean) : [];
+  const value = p.filesStatus === 'saved' && names.length
+    ? names.map(escapeHtml).join(' · ')
+    : escapeHtml(p.filesNote || (p.filesStatus === 'pending' ? 'Waiting for folder access' : 'Not saved'));
+  return `
+      <div class="paper-detail-row">
+        <span class="paper-detail-label">Files</span>
+        <span class="paper-detail-value">${value}</span>
+      </div>`;
 }
 
 // ─── Rendering ────────────────────────────────────────────────────────────────
@@ -741,7 +785,7 @@ let editingColumnId = null;
 
 const COLUMN_DEFS = {
   title:   { track: 'minmax(150px, 1fr)',  min: 150 },
-  figure:  { track: '120px',               min: 120 },
+  figure:  { track: '160px',               min: 160 },
   authors: { track: 'minmax(80px, 0.7fr)', min: 80,  label: 'Authors' },
   year:    { track: '56px',                min: 56,  label: 'Year' },
   note:    { track: 'minmax(200px, 1fr)',  min: 200, label: 'Note' },
@@ -1274,6 +1318,7 @@ async function deleteSelected() {
   const figureKeys = ids.map(id => papers[id] && papers[id].figureKey).filter(Boolean);
   for (const id of ids) delete papers[id];
   if (figureKeys.length) chrome.storage.local.remove(figureKeys);
+  libraryFolder().then(lf => Promise.all(ids.map(id => lf.deleteFigureImage(id)))).catch(() => {});
   await chrome.storage.local.set({ [PAPERS_KEY]: papers });
 
   selectedIds.clear();
@@ -1363,6 +1408,7 @@ async function deletePaper(id) {
   delete papers[id];
   await chrome.storage.local.set({ [PAPERS_KEY]: papers });
   if (figureKey) await chrome.storage.local.remove(figureKey);
+  (await libraryFolder()).deleteFigureImage(id).catch(() => {});
 }
 
 document.addEventListener('click', async (e) => {
@@ -1391,7 +1437,7 @@ document.addEventListener('click', async (e) => {
 
     if (action === 'view-figure') {
       const img = actionBtn.querySelector('img');
-      if (img) openFigureLightbox(img.src);
+      if (img) showFigure(row.dataset.id, img.src);
       return;
     }
     if (action === 'toggle-star') {
@@ -1570,8 +1616,7 @@ if (chrome.tabs && chrome.tabs.onCreated && chrome.tabs.onRemoved) {
 
 // ─── Export / Import ──────────────────────────────────────────────────────────
 
-function downloadJson(filename, obj) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+function downloadBlob(filename, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -1583,20 +1628,84 @@ function downloadJson(filename, obj) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function exportLibrary() {
+// The library folder and zip helpers are ES modules; load them on demand.
+const libraryFolder = () => import('./library-folder.js');
+const archive = () => import('./archive.js');
+
+const LIBRARY_JSON = 'paperclip-library.json';
+const FILES_DIR = 'files/';
+
+async function libraryEnvelope() {
   const papers = await getPapers();
   const { tags, columns } = await getTagModel();
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-  downloadJson(`paperclip-backup-${stamp}.json`, {
-    schema: 'paperclip.library.v3',
+  // Figure thumbnails live under their own storage keys; carry them along.
+  const figureKeys = Object.values(papers).map(p => p.figureKey).filter(Boolean);
+  const figures = figureKeys.length ? await chrome.storage.local.get(figureKeys) : {};
+  return {
+    schema: 'paperclip.library.v4',
     exportedAt: new Date().toISOString(),
     paperCount: Object.keys(papers).length,
     tagCount: Object.keys(tags).length,
     papers,
     tags,
     tagColumns: columns,
-  });
-  return { count: Object.keys(papers).length };
+    figures,
+  };
+}
+
+/**
+ * Export a .zip with the library JSON plus every saved paper's PDF and title
+ * image from the library folder (under files/). Call from a click: it may
+ * ask for folder access and opens a save dialog.
+ */
+async function exportLibrary() {
+  const [lf, ar] = await Promise.all([libraryFolder(), archive()]);
+  const envelope = await libraryEnvelope();
+  const entries = [{
+    name: LIBRARY_JSON,
+    blob: new Blob([JSON.stringify(envelope, null, 2)], { type: 'application/json' }),
+  }];
+
+  let missing = 0;
+  let folderSkipped = false;
+  const dir = await lf.getFolder();
+  if (dir) {
+    if ((await lf.folderAccess(dir, { request: true })) === 'granted') {
+      const seen = new Set();
+      for (const p of Object.values(envelope.papers)) {
+        for (const name of [p.files && p.files.pdf, p.files && p.files.image]) {
+          if (!name || seen.has(name)) continue;
+          seen.add(name);
+          const file = await lf.readFile(dir, name);
+          if (file) entries.push({ name: FILES_DIR + name, blob: file });
+          else missing++;
+        }
+      }
+    } else {
+      folderSkipped = true;
+    }
+  }
+
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const filename = `paperclip-backup-${stamp}.zip`;
+  // Prefer a save dialog: the zip streams straight to disk. If it can't be
+  // shown (e.g. the click was used up asking for folder access), build the
+  // zip in memory and download it.
+  let sink = null;
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: filename,
+      types: [{ description: 'Zip archive', accept: { 'application/zip': ['.zip'] } }],
+    });
+    sink = await handle.createWritable();
+  } catch (err) {
+    if (err && err.name === 'AbortError') return { cancelled: true };
+  }
+  const memory = sink ? null : ar.memorySink();
+  await ar.writeZip(entries, sink || memory);
+  if (memory) downloadBlob(filename, memory.blob());
+
+  return { count: envelope.paperCount, files: entries.length - 1, missing, folderSkipped };
 }
 
 function isImportablePaper(p) {
@@ -1642,6 +1751,17 @@ function mergeImportedPaper(target, incoming) {
   if (incoming.readStatus === 'read') target.readStatus = 'read';
   if (incoming.starred) target.starred = true;
 
+  // Saved files and figure: take the incoming ones if we have none.
+  if (!target.files && incoming.files) {
+    target.files = incoming.files;
+    target.filesStatus = incoming.filesStatus;
+  }
+  if (target.figureStatus !== 'ok' && incoming.figureStatus === 'ok') {
+    target.figureKey = incoming.figureKey;
+    target.figureStatus = 'ok';
+    target.figurePage = incoming.figurePage;
+  }
+
   // Tag membership: union by id (so an auto-tagged import adds tags to
   // existing papers without removing any the user manually added).
   const targetTags = Array.isArray(target.tags) ? target.tags : [];
@@ -1655,20 +1775,77 @@ function mergeImportedPaper(target, incoming) {
   }
 }
 
+/**
+ * Import a library backup: a .zip from exportLibrary(), or a plain .json
+ * (older backups). Files in the zip go into the library folder; a file whose
+ * name is already taken there is left alone (never overwritten).
+ */
 async function importLibrary(file) {
-  const text = await file.text();
+  const isZip = /\.zip$/i.test(file.name) || file.type === 'application/zip';
   let parsed;
+  let fileEntries = [];
   try {
-    parsed = JSON.parse(text);
-  } catch {
-    return { error: 'Could not parse the file as JSON.' };
+    if (isZip) {
+      const entries = await (await archive()).readZip(file);
+      const json = entries.find(e => e.name === LIBRARY_JSON) ||
+                   entries.find(e => !e.name.includes('/') && /\.json$/i.test(e.name));
+      if (!json) return { error: `No ${LIBRARY_JSON} in this zip.` };
+      parsed = JSON.parse(await json.blob.text());
+      fileEntries = entries.filter(e => e.name.startsWith(FILES_DIR) && e.name.length > FILES_DIR.length);
+    } else {
+      parsed = JSON.parse(await file.text());
+    }
+  } catch (err) {
+    return { error: isZip ? `Could not read the zip: ${err.message}` : 'Could not parse the file as JSON.' };
   }
 
+  const result = await importLibraryData(parsed);
+  if (result.error || !fileEntries.length) return result;
+  return { ...result, ...(await importLibraryFiles(fileEntries)) };
+}
+
+/** Write the zip's files/ entries into the library folder. */
+async function importLibraryFiles(fileEntries) {
+  const lf = await libraryFolder();
+  const dir = await lf.getFolder();
+  let access = 'none';
+  try { access = await lf.folderAccess(dir, { request: true }); } catch {}
+  if (access !== 'granted') {
+    return { filesNote: dir
+      ? 'PDFs and images not imported: reconnect the library folder, then import again.'
+      : 'PDFs and images not imported: choose a library folder, then import again.' };
+  }
+
+  let filesWritten = 0, filesKept = 0;
+  for (const { name, blob } of fileEntries) {
+    const base = name.slice(FILES_DIR.length);
+    // Only plain file names; never write outside the folder.
+    if (!base || base.includes('/') || base.includes('\\') || base.startsWith('.')) continue;
+    if (await lf.fileExists(dir, base)) { filesKept++; continue; }
+    await lf.writeFile(dir, base, blob);
+    filesWritten++;
+  }
+
+  // Papers whose files are now all in the folder count as saved.
+  const papers = await getPapers();
+  for (const p of Object.values(papers)) {
+    if (!p.files || p.filesStatus === 'saved') continue;
+    const names = [p.files.pdf, p.files.image].filter(Boolean);
+    let all = names.length > 0;
+    for (const n of names) if (!(await lf.fileExists(dir, n))) all = false;
+    if (all) { p.filesStatus = 'saved'; delete p.filesNote; }
+  }
+  await chrome.storage.local.set({ [PAPERS_KEY]: papers });
+  return { filesWritten, filesKept };
+}
+
+async function importLibraryData(parsed) {
   // Accept envelope shape { papers: {...}, tags?: {...} } or raw map of papers
   const hasEnvelope = parsed && typeof parsed === 'object' && parsed.papers && typeof parsed.papers === 'object';
   const incomingPapers = hasEnvelope ? parsed.papers : parsed;
   const incomingTags = hasEnvelope && parsed.tags && typeof parsed.tags === 'object' ? parsed.tags : {};
   const incomingColumns = hasEnvelope && parsed.tagColumns && typeof parsed.tagColumns === 'object' ? parsed.tagColumns : {};
+  const incomingFigures = hasEnvelope && parsed.figures && typeof parsed.figures === 'object' ? parsed.figures : {};
 
   if (!incomingPapers || typeof incomingPapers !== 'object') {
     return { error: 'Unexpected file shape — expected an object of papers.' };
@@ -1721,7 +1898,16 @@ async function importLibrary(file) {
     }
   }
 
-  await chrome.storage.local.set({ [PAPERS_KEY]: papers, [TAGS_KEY]: tags, [TAG_COLUMNS_KEY]: columns });
+  // Figure thumbnails the library doesn't have yet.
+  const figureWrites = {};
+  const existingFigures = await chrome.storage.local.get(Object.keys(incomingFigures));
+  for (const [key, dataUrl] of Object.entries(incomingFigures)) {
+    if (key.startsWith('figure:') && typeof dataUrl === 'string' && dataUrl.startsWith('data:image/') && !existingFigures[key]) {
+      figureWrites[key] = dataUrl;
+    }
+  }
+
+  await chrome.storage.local.set({ [PAPERS_KEY]: papers, [TAGS_KEY]: tags, [TAG_COLUMNS_KEY]: columns, ...figureWrites });
   return { added, merged, skipped, tagsAdded };
 }
 
@@ -1734,6 +1920,50 @@ function setSettingsStatus(text) {
   el.hidden = false;
   clearTimeout(setSettingsStatus._t);
   setSettingsStatus._t = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+// ─── Library folder (settings) ────────────────────────────────────────────────
+
+/** Write files parked while the folder wasn't accessible. Returns how many papers. */
+async function flushPendingFiles() {
+  const lf = await libraryFolder();
+  const dir = await lf.writableFolder();
+  if (!dir) return 0;
+  const written = await lf.flushPending(dir, Object.values(await getPapers()));
+  const ids = Object.keys(written);
+  if (!ids.length) return 0;
+  const papers = await getPapers(); // fresh read: don't clobber concurrent edits
+  for (const id of ids) {
+    if (!papers[id]) continue;
+    papers[id].files = written[id];
+    papers[id].filesStatus = 'saved';
+    delete papers[id].filesNote;
+  }
+  await chrome.storage.local.set({ [PAPERS_KEY]: papers });
+  return ids.length;
+}
+
+async function refreshFolderUI() {
+  const nameEl = document.getElementById('folderName');
+  const hintEl = document.getElementById('folderHint');
+  const reconnectBtn = document.getElementById('folderReconnectBtn');
+  if (!nameEl) return;
+  const lf = await libraryFolder();
+  const dir = await lf.getFolder();
+  const access = await lf.folderAccess(dir);
+  const waiting = Object.values(await getPapers()).filter(p => p.filesStatus === 'pending').length;
+
+  nameEl.textContent = dir ? dir.name : 'Not set';
+  nameEl.classList.toggle('is-unset', !dir);
+  reconnectBtn.hidden = !(dir && access !== 'granted');
+  if (!dir) {
+    hintEl.textContent = 'Choose where PDFs and title images of papers you save are kept.';
+  } else if (access !== 'granted') {
+    hintEl.textContent = 'Chrome needs your OK to use this folder again.' +
+      (waiting ? ` ${waiting} paper${waiting === 1 ? '' : 's'} waiting to be saved.` : '');
+  } else {
+    hintEl.textContent = 'PDFs and title images of papers you save go here.';
+  }
 }
 
 async function refreshSettingsInfo() {
@@ -1776,6 +2006,7 @@ function initSettingsMenu() {
     if (menu.hidden) {
       menu.hidden = false;
       refreshSettingsInfo();
+      refreshFolderUI();
     } else {
       menu.hidden = true;
     }
@@ -1793,10 +2024,39 @@ function initSettingsMenu() {
     e.stopPropagation();
     const action = item.dataset.settingsAction;
     if (action === 'export') {
-      const { count } = await exportLibrary();
-      setSettingsStatus(`Exported ${count} paper${count === 1 ? '' : 's'}.`);
+      setSettingsStatus('Exporting…');
+      try {
+        const r = await exportLibrary();
+        if (r.cancelled) { setSettingsStatus('Export cancelled.'); return; }
+        let msg = `Exported ${r.count} paper${r.count === 1 ? '' : 's'} with ${r.files} file${r.files === 1 ? '' : 's'}.`;
+        if (r.missing) msg += ` ${r.missing} file${r.missing === 1 ? ' was' : 's were'} missing from the folder.`;
+        if (r.folderSkipped) msg += ' Files skipped: folder access not allowed.';
+        setSettingsStatus(msg);
+      } catch (err) {
+        setSettingsStatus(`Export failed: ${err.message}`);
+      }
     } else if (action === 'import') {
       fileInput.click();
+    } else if (action === 'choose-folder') {
+      try {
+        await (await libraryFolder()).chooseFolder();
+      } catch (err) {
+        if (err && err.name !== 'AbortError') setSettingsStatus(`Couldn't use that folder: ${err.message}`);
+        return;
+      }
+      const n = await flushPendingFiles();
+      await refreshFolderUI();
+      setSettingsStatus(n ? `Folder set. Saved files for ${n} waiting paper${n === 1 ? '' : 's'}.` : 'Folder set.');
+    } else if (action === 'reconnect-folder') {
+      const lf = await libraryFolder();
+      const access = await lf.folderAccess(await lf.getFolder(), { request: true });
+      if (access === 'granted') {
+        const n = await flushPendingFiles();
+        setSettingsStatus(n ? `Reconnected. Saved files for ${n} waiting paper${n === 1 ? '' : 's'}.` : 'Reconnected.');
+      } else {
+        setSettingsStatus('Folder access was not allowed.');
+      }
+      await refreshFolderUI();
     }
   });
 
@@ -1812,8 +2072,11 @@ function initSettingsMenu() {
     } else {
       const parts = [`${result.added} new`, `${result.merged} merged`];
       if (result.skipped) parts.push(`${result.skipped} skipped`);
-      setSettingsStatus('Imported: ' + parts.join(', '));
+      if (result.filesWritten != null) parts.push(`${result.filesWritten} file${result.filesWritten === 1 ? '' : 's'} added to the folder`);
+      if (result.filesKept) parts.push(`${result.filesKept} already there`);
+      setSettingsStatus('Imported: ' + parts.join(', ') + '.' + (result.filesNote ? ' ' + result.filesNote : ''));
       refreshSettingsInfo();
+      refreshFolderUI();
     }
   });
 }
@@ -2247,6 +2510,8 @@ function init() {
   initColumnResize();
   initColumnReorder();
   initFrozenColumn();
+  // Files parked while the folder wasn't accessible: write them now if it is.
+  flushPendingFiles().catch(err => console.warn('[paperclip] pending files', err));
 
   // Ask the service worker to scan all currently-open tabs and add any
   // papers we don't have yet. Storage.onChanged will trigger a re-render

@@ -592,6 +592,80 @@ header {
   box-shadow: 0 0 0 2px rgba(61, 122, 74, 0.25);
 }
 
+.settings-folder {
+  padding: 6px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-folder-label {
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.settings-folder-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.settings-folder-name {
+  min-width: 0;
+  font-size: 13px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-folder-name::before {
+  content: '📁 ';
+}
+
+.settings-folder-name.is-unset {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.settings-folder-name.is-unset::before {
+  content: '';
+}
+
+.settings-folder-btn {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--warm-gray);
+  border-radius: 6px;
+  background: var(--card-bg);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.settings-folder-btn:hover {
+  border-color: var(--muted);
+}
+
+.settings-folder-reconnect {
+  align-self: flex-start;
+  border-color: var(--accent-amber);
+  color: var(--accent-amber);
+}
+
+.settings-folder-hint {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+  max-width: 240px;
+}
+
 .settings-divider {
   height: 1px;
   background: var(--warm-gray);
@@ -755,7 +829,7 @@ header {
 .paper-figure-img {
   display: block;
   width: 100%;
-  max-height: 96px;
+  max-height: 130px;
   object-fit: contain;
 }
 

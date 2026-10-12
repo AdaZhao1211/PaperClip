@@ -26,13 +26,23 @@
       <span class="settings-switch-track" aria-hidden="true"></span>
     </label>
     <div class="settings-divider"></div>
+    <div class="settings-folder">
+      <div class="settings-folder-label">Library folder</div>
+      <div class="settings-folder-row">
+        <span class="settings-folder-name is-unset" id="folderName">Not set</span>
+        <button class="settings-folder-btn" data-settings-action="choose-folder">Choose…</button>
+      </div>
+      <button class="settings-folder-btn settings-folder-reconnect" id="folderReconnectBtn" data-settings-action="reconnect-folder" hidden>Reconnect folder</button>
+      <div class="settings-folder-hint" id="folderHint"></div>
+    </div>
+    <div class="settings-divider"></div>
     <button class="settings-menu-item" data-settings-action="export">
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
         <polyline points="7 10 12 15 17 10"/>
         <line x1="12" x2="12" y1="15" y2="3"/>
       </svg>
-      Export library to JSON
+      Export library (.zip)…
     </button>
     <button class="settings-menu-item" data-settings-action="import">
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -40,7 +50,7 @@
         <polyline points="17 8 12 3 7 8"/>
         <line x1="12" x2="12" y1="3" y2="15"/>
       </svg>
-      Import library from JSON…
+      Import library (.zip or .json)…
     </button>
     <div class="settings-divider"></div>
     <div class="settings-info" id="settingsInfo">—</div>
@@ -71,7 +81,7 @@
       <input type="search" id="paperSearch" placeholder="Search by title, author, venue…" autocomplete="off">
     </div>
 
-    <input type="file" id="importFile" accept="application/json,.json" hidden>
+    <input type="file" id="importFile" accept=".zip,.json,application/zip,application/json" hidden>
 
     <div class="paper-table">
       <div class="paper-table-inner">
